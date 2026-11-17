@@ -5,23 +5,23 @@ import type { Db } from '../orchestrator/db.js';
 import type { Bus } from '../orchestrator/bus.js';
 import type { JsonSchema, ToolContext, ToolRegistry } from '../tools/index.js';
 import { readText } from '../tools/paths.js';
-import { extractShotIds, readEpisodeShots, sortShotIds } from '../tools/episode-source.js';
+import { extractShotIds, readEpisodeBible, readEpisodeShots, sortShotIds } from '../tools/episode-source.js';
 import { formatStageCards } from '../tools/staging.js';
 import { detectEpisodeLanguage, directorSizeMismatches } from '../tools/whatif.js';
+import { PROMPTING_GUIDE } from '../orchestrator/director-guide.js';
 import { episodePin, shotWordFrames } from '../orchestrator/context.js';
-import { engineDigest } from '../orchestrator/engine-digest.js';
+import { mediaEnvForSubprocess } from '../orchestrator/media-providers.js';
 import {
   MAX_STRIKES,
   type ReviewIssue,
   type ReviewReport,
-  accentMetrics,
   deltaReviewerSystemPrompt,
+  diffusionMetrics,
   formatReviewFeedback,
   nextStrikes,
   refusedUnchanged,
   reviewerSystemPrompt,
-  staticMetrics,
-  summarizeShotsCode,
+  summarizeShotPrompts,
   timingMetrics,
   writeUnresolvedDefects,
 } from '../orchestrator/reviewer.js';
@@ -63,16 +63,20 @@ function readPreviousReview(outDir: string): ReviewReport | null {
   return null;
 }
 
-function episodeAspect(projectRoot: string, epRaw: string): string {
+function episodeAspect(_projectRoot: string, epRaw: string, epDir?: string): string {
   try {
     const a = String(JSON.parse(epRaw)?.aspect ?? '');
     if (a === '9:16' || a === '16:9') return a;
   } catch {
     /* fall through */
   }
-  const cfg = readText(path.join(projectRoot, 'src'), 'studio.config.ts', 50_000) ?? '';
-  if (/aspect\s*:\s*['"]9:16['"]/.test(cfg) || (/width\s*:\s*1080\b/.test(cfg) && /height\s*:\s*1920\b/.test(cfg))) {
-    return '9:16';
+  if (epDir) {
+    try {
+      const b = JSON.parse(readText(epDir, 'bible.json', 20_000) ?? '{}');
+      if (b?.aspect === '9:16' || b?.aspect === '16:9') return b.aspect;
+    } catch {
+      /* fall through */
+    }
   }
   return '16:9';
 }
@@ -80,6 +84,8 @@ function episodeAspect(projectRoot: string, epRaw: string): string {
 export function listMcpTools(registry: ToolRegistry): McpToolSpec[] {
   const stageSchema = registry.get('stage_shots')?.schema ?? { type: 'object', properties: {} };
   const runSchema = registry.get('whatif_run')?.schema ?? { type: 'object', properties: {} };
+  const writeBibleSchema = registry.get('write_bible')?.schema ?? { type: 'object', properties: {} };
+  const editShotSchema = registry.get('edit_shot')?.schema ?? { type: 'object', properties: {} };
 
   const withProjectProp = (schema: JsonSchema): JsonSchema => ({
     ...schema,
@@ -96,7 +102,7 @@ export function listMcpTools(registry: ToolRegistry): McpToolSpec[] {
     {
       name: 'whatif_create_project',
       description:
-        'Create (or reuse) a What If Studio project in data/projects/<project> and scaffold src/episodes/<episode> with the latest 2D engine overlay (shot(), cast(), place(), 6 perspectives, OTS/POV, phoneShot, tabletopShot). Registers the project in the Studio database so it is also visible on http://localhost:3000.',
+        'Create (or reuse) a 100% AI Diffusion What If Studio project in data/projects/<project> and scaffold src/episodes/<episode> (no SVG/TSX engine). Registers the project in the Studio database so it is also visible on http://localhost:3020.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -113,19 +119,20 @@ export function listMcpTools(registry: ToolRegistry): McpToolSpec[] {
     {
       name: 'whatif_run',
       description:
-        'Run a What If pipeline step inside the Studio environment (:8005 TTS/ASR + Modal cloud render + layout/code audits): source | voice | shotlist | plan | stills | board | sfx | render | master | install. Note: before step="render", the independent Reviewer subagent must audit the current board via whatif_review_pack + whatif_save_review.',
+        'Run a What If diffusion pipeline step (:8005 TTS/ASR + Nano Banana 2 Lite refs/stills + Gemini Omni Flash 2.1 I2V clips + FFmpeg/LUFS render + optional Modal Anime 2D upscale): source | voice | shotlist | plan | refs | stills | board | clips | render | master | upscale. Note: before step="clips" or step="render", the independent Reviewer subagent must audit the current board via whatif_review_pack + whatif_save_review.',
       inputSchema: withProjectProp(runSchema),
     },
     {
       name: 'whatif_episode_pin',
       description:
-        'Read the live Continuity, Language & Casting Pin for an episode: language lock (fr/en), narrator voice & POV lock (Léa/Hugo, first/third), shared.tsx summary, all shot lengths/sizes/views/accents/looks, exported vs missing shots, and optionally the full 2D engine export digest.',
+        'Read the live Continuity, Bible & Diffusion Prompting Pin for an episode: language lock (fr/en), narrator voice & POV lock (Léa/Hugo, first/third), bible.json cast/places + refs state, shot lengths/moods, authored vs missing shots, word@frame anchors, and optionally the Diffusion Prompting Guide.',
       inputSchema: {
         type: 'object',
         properties: {
           episode: { type: 'string' },
           project: { type: 'string' },
-          includeEngineDigest: { type: 'boolean', description: 'Include full src/engine TypeScript export & Pose signatures (set true once before coding shared.tsx).' },
+          includePromptGuide: { type: 'boolean', description: 'Include full Nano Banana 2 Lite & Gemini Omni Flash 2.1 prompting guide.' },
+          includeEngineDigest: { type: 'boolean', description: 'Legacy alias for includePromptGuide.' },
         },
         required: ['episode'],
         additionalProperties: false,
@@ -134,7 +141,7 @@ export function listMcpTools(registry: ToolRegistry): McpToolSpec[] {
     {
       name: 'whatif_shot_words',
       description:
-        'Read measured word@frame timings on each shot own clock (0..len at 30fps) so person beats and camera beats land on the exact spoken word.',
+        'Read measured word@frame timings on each shot own clock (0..len at 30fps) so actions and camera moves land on the exact spoken word.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -147,37 +154,33 @@ export function listMcpTools(registry: ToolRegistry): McpToolSpec[] {
       },
     },
     {
+      name: 'whatif_write_bible',
+      description:
+        'Write and validate src/episodes/<episode>/bible.json (stylePrompt, negativePrompt, characters[{id,name,role,appearance,refPrompt}], places[{id,name,recipe,description,refPrompt}]) BEFORE running whatif_run { step: "refs" }.',
+      inputSchema: withProjectProp(writeBibleSchema),
+    },
+    {
       name: 'whatif_stage_shots',
       description:
-        'Save the mandatory staging cards of each shot BEFORE coding shots (subject, see, people, handled objects, angle, view, cam, zone, foreground, moves, change) and run anti-monotony & staging audits.',
+        'Save the mandatory staging cards of each shot BEFORE authoring shot prompts (place, people, props, angle, view, focus, pose, moves) and run anti-monotony & staging audits.',
       inputSchema: withProjectProp(stageSchema),
     },
     {
       name: 'whatif_edit_shot',
       description:
-        'Write or replace a single shot S<N> in isolated modular file src/episodes/<episode>/shots/S<N>.tsx, auto-importing React + engine helpers + ../shared symbols, syncing the shots.tsx barrel & index.tsx, and running TypeScript checks.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          episode: { type: 'string' },
-          project: { type: 'string' },
-          id: { type: 'string', description: 'Shot ID such as "S1", "S12".' },
-          code: { type: 'string', description: 'Full TypeScript/JSX code for this shot ending with `export const S<N> = ...`.' },
-        },
-        required: ['episode', 'id', 'code'],
-        additionalProperties: false,
-      },
+        'Write or update one JSON diffusion shot spec (src/episodes/<episode>/shots/S<N>.json) or a batch array `shots[]` (place, characters, size, angle, view, cameraMove, onScreenText, imagePrompt, videoPrompt, sfxHint) validated against bible.json, NO title cards, NO music/speech in Omni SFX.',
+      inputSchema: withProjectProp(editShotSchema),
     },
     {
       name: 'whatif_write_file',
       description:
-        'Write or append a project-relative text file inside the episode workspace (e.g. "src/episodes/<slug>/DIRECTOR.md", "src/episodes/<slug>/shared.tsx", "src/episodes/<slug>/episode.json", or "PROJECT.md") with automatic shared.tsx export normalization and barrel sync.',
+        'Write or append a project-relative text/JSON/MD file inside the episode workspace (e.g. "src/episodes/<slug>/DIRECTOR.md", "src/episodes/<slug>/bible.json", "src/episodes/<slug>/shots/S1.json", "src/episodes/<slug>/episode.json", or "PROJECT.md") with automatic diffusion JSON validation.',
       inputSchema: {
         type: 'object',
         properties: {
           project: { type: 'string', description: 'Project slug in data/projects/<project>.' },
           episode: { type: 'string', description: 'Episode slug (used as default project slug if project is omitted).' },
-          path: { type: 'string', description: 'Project-relative file path (e.g. "src/episodes/my-ep/shared.tsx" or "PROJECT.md").' },
+          path: { type: 'string', description: 'Project-relative file path (e.g. "src/episodes/my-ep/DIRECTOR.md" or "PROJECT.md").' },
           content: { type: 'string' },
           append: { type: 'boolean' },
         },
@@ -204,7 +207,7 @@ export function listMcpTools(registry: ToolRegistry): McpToolSpec[] {
     {
       name: 'whatif_review_pack',
       description:
-        'Prepare the complete Independent Reviewer audit dossier after `board`: detects Round 1 (Global 100% contact sheets) vs Round 2+ (Targeted High-Res Delta stills on flagged/modified shots), returns hostImagePaths to inspect visually, Reviewer criteria matched to episode language (FR/EN), script, DIRECTOR.md, staging cards, AST per-shot code summary, and automatic metrics.',
+        'Prepare the complete Independent Reviewer audit dossier after `board`: detects Round 1 (Global 100% contact sheets + refs) vs Round 2+ (Targeted High-Res Delta stills + refs on flagged/modified shots), returns relativeImagePaths/hostImagePaths to inspect visually, Reviewer criteria matched to episode language (FR/EN), script, bible.json, DIRECTOR.md, staging cards, shot JSON specs, and diffusion metrics.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -219,7 +222,7 @@ export function listMcpTools(registry: ToolRegistry): McpToolSpec[] {
     {
       name: 'whatif_save_review',
       description:
-        'Record the Independent Reviewer subagent verdict into out/<episode>/review.json (updating per-shot strike counts, unblocking `render` when `pass: true` or after maxRounds/3-strikes with DEFAUTS-NON-CORRIGES.md, or keeping `blocking: true` while fixes are required).',
+        'Record the Independent Reviewer subagent verdict into out/<episode>/review.json (updating per-shot strike counts, unblocking `clips` & `render` when `pass: true` or after maxRounds/3-strikes with DEFAUTS-NON-CORRIGES.md, or keeping `blocking: true` while fixes are required).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -251,7 +254,7 @@ export function listMcpTools(registry: ToolRegistry): McpToolSpec[] {
     },
     {
       name: 'whatif_status',
-      description: 'Check completion state of an episode (script, voice, words, timeline, director, stills, board, review, sfx, render, final, LUFS report).',
+      description: 'Check completion state of an episode (script, voice, words, timeline, director, bible, refs, staged, shotsJSON, stills, board, review, clips, sfx, render, final, LUFS report, upscale).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -319,7 +322,15 @@ export async function callMcpTool(
           aspect,
           ...(video ? { video } : {}),
         },
-        { projectId, projectRoot: root, dataRoot: config.dataRoot, skillDir: config.skillDir, log: (l) => logs.push(l), signal },
+        {
+          projectId,
+          projectRoot: root,
+          dataRoot: config.dataRoot,
+          skillDir: config.skillDir,
+          mediaEnv: mediaEnvForSubprocess(db, process.env, config.dataRoot),
+          log: (l) => logs.push(l),
+          signal,
+        },
       );
       toolRes = { ok: r.ok, summary: r.summary };
       if (!r.ok) return { ok: false, summary: r.summary, projectRoot: root };
@@ -356,6 +367,7 @@ export async function callMcpTool(
     projectRoot,
     dataRoot: config.dataRoot,
     skillDir: config.skillDir,
+    mediaEnv: mediaEnvForSubprocess(db, process.env, config.dataRoot),
     log: (line) => logs.push(line),
     signal,
   };
@@ -367,8 +379,8 @@ export async function callMcpTool(
     const skipReview = rawStepArgs.includes('--skip-review');
     const cleanArgs = rawStepArgs.filter((a) => a !== '--skip-review');
 
-    // Enforce independent Reviewer subagent check before cloud video render
-    if (step === 'render' && !skipReview) {
+    // Enforce independent Reviewer subagent check before I2V clips generation or final render
+    if ((step === 'clips' || step === 'render') && !skipReview) {
       const outDir = path.join(projectRoot, 'out', episode);
       const boardPath = path.join(outDir, 'storyboard.jpg');
       const revPath = path.join(outDir, 'review.json');
@@ -384,10 +396,10 @@ export async function callMcpTool(
             ok: false,
             projectRoot,
             summary:
-              `STOP BEFORE RENDER: the current storyboard for "${episode}" has not been audited by the Independent Reviewer subagent yet.\n` +
+              `STOP BEFORE ${step.toUpperCase()}: the current storyboard for "${episode}" has not been audited by the Independent Reviewer subagent yet.\n` +
               `1. Launch a read-only Reviewer subagent (define_subagent / invoke_subagent) so it inspects the board with fresh eyes,\n` +
-              `2. Have it call whatif_review_pack({ episode: "${episode}" }), visually inspect hostImagePaths with read_file, and save its verdict via whatif_save_review({ episode: "${episode}", ... }),\n` +
-              `3. Once review passes (or closes at final round), call whatif_run({ episode: "${episode}", step: "render" }).`,
+              `2. Have it call whatif_review_pack({ episode: "${episode}" }), visually inspect hostImagePaths (refs + storyboard sheets/stills) with read_file, and save its verdict via whatif_save_review({ episode: "${episode}", ... }),\n` +
+              `3. Once review passes (or closes at final round), call whatif_run({ episode: "${episode}", step: "${step}" }).`,
           };
         }
       }
@@ -412,14 +424,20 @@ export async function callMcpTool(
 
   if (name === 'whatif_episode_pin') {
     const pin = episodePin(projectRoot);
-    const digest = rawArgs.includeEngineDigest ? engineDigest(projectRoot) : '';
+    const includeGuide = Boolean(rawArgs.includePromptGuide || rawArgs.includeEngineDigest);
     const summary = [
       pin || `(no active episode pin found in ${projectRoot})`,
-      digest ? `\n## Engine exports & Pose types (src/engine)\n${digest}` : '',
+      includeGuide ? `\n## Diffusion Prompting Guide\n${PROMPTING_GUIDE}` : '',
     ]
       .filter(Boolean)
       .join('\n');
     return { ok: true, projectRoot, summary };
+  }
+
+  if (name === 'whatif_write_bible') {
+    const { project: _p, ...rest } = rawArgs;
+    const res = await registry.run('write_bible', rest, ctx);
+    return { ok: res.ok, projectRoot, summary: res.summary, data: res.data };
   }
 
   if (name === 'whatif_shot_words') {
@@ -489,13 +507,14 @@ export async function callMcpTool(
       return {
         ok: false,
         projectRoot,
-        summary: `No code changed on the refused shots (${stuck.join(', ')}) since the last review! Edit them with whatif_edit_shot, then re-run stills (${JSON.stringify(stuck)}) and board before re-running the Reviewer.`,
+        summary: `No shot prompt/bible changed on the refused shots (${stuck.join(', ')}) since the last review! Edit them with whatif_edit_shot, then re-run stills (${JSON.stringify(stuck)}) and board before re-running the Reviewer.`,
       };
     }
 
     const epRaw = readText(epDir, 'episode.json', 3_000_000) ?? '{}';
     const directorRaw = readText(epDir, 'DIRECTOR.md', 200_000) ?? '(aucun DIRECTOR.md)';
-    const bibleRaw = readText(epDir, 'bible.json', 8_000) ?? '';
+    const bibleRaw = readText(epDir, 'bible.json', 20_000) ?? '';
+    const bibleRes = readEpisodeBible(epDir);
     let ep: any = {};
     try {
       ep = JSON.parse(epRaw);
@@ -511,9 +530,31 @@ export async function callMcpTool(
 
     const epLang = detectEpisodeLanguage(ep);
     const langUpper = epLang.toUpperCase();
-    const aspect = episodeAspect(projectRoot, epRaw);
+    const aspect = episodeAspect(projectRoot, epRaw, epDir);
     const epSrc = readEpisodeShots(epDir);
-    const stagedShots = (Array.isArray(ep?.shots) ? ep.shots : []).filter((s: any) => s?.stage);
+
+    let stageFileCards: Record<string, any> = {};
+    try {
+      const rawStage = JSON.parse(fs.readFileSync(path.join(epDir, 'shots.stage.json'), 'utf8'));
+      stageFileCards = (rawStage?.cards && typeof rawStage.cards === 'object' ? rawStage.cards : rawStage) ?? {};
+    } catch {
+      /* optional */
+    }
+    const stagedShots = (() => {
+      const merged = Array.isArray(ep?.shots) ? ep.shots.map((s: any) => ({ ...s })) : [];
+      const byId = new Map<string, any>(merged.filter((s: any) => s?.id).map((s: any) => [String(s.id).toUpperCase(), s]));
+      for (const [k, card] of Object.entries(stageFileCards)) {
+        const id = k.toUpperCase();
+        if (!/^S\d+$/.test(id) || !card || typeof card !== 'object') continue;
+        if (byId.has(id)) byId.get(id)!.stage = byId.get(id)!.stage ?? card;
+        else {
+          const item = { id, stage: card };
+          merged.push(item);
+          byId.set(id, item);
+        }
+      }
+      return merged.filter((s: any) => s?.stage);
+    })();
 
     const shotTimings = new Map<string, { len: number; key: number }>();
     for (const s of Array.isArray(timeline?.shots) ? timeline.shots : []) {
@@ -541,6 +582,19 @@ export async function callMcpTool(
           .sort((a, b) => a.localeCompare(b, 'en', { numeric: true }))
       : [];
 
+    const refsDir = path.join(outDir, 'refs');
+    const allRefRelPaths = fs.existsSync(refsDir)
+      ? fs
+          .readdirSync(refsDir)
+          .filter((n) => /\.png$/i.test(n))
+          .sort((a, b) => {
+            const ac = a.startsWith('char_') ? 0 : 1;
+            const bc = b.startsWith('char_') ? 0 : 1;
+            return ac !== bc ? ac - bc : a.localeCompare(b);
+          })
+          .map((n) => `out/${slug}/refs/${n}`)
+      : [];
+
     const prevReview = readPreviousReview(outDir);
     const prevErrors = prevReview?.ok && !prevReview.pass ? prevReview.issues.filter((i) => i.severity === 'error') : [];
     const prevRound = typeof prevReview?.round === 'number' ? prevReview.round : 0;
@@ -550,7 +604,7 @@ export async function callMcpTool(
     const modifiedShots: string[] = [];
     if (prevCreatedMs > 0) {
       for (const [id, mt] of epSrc.shotMtimesMs) {
-        if (epSrc.isModular && mt > prevCreatedMs + 500) modifiedShots.push(id);
+        if (mt > prevCreatedMs + 500) modifiedShots.push(id);
       }
       for (const id of boardStillIds) {
         try {
@@ -580,7 +634,7 @@ export async function callMcpTool(
         .map((s: any) => {
           const id = String(s?.id ?? '').toUpperCase();
           const tm = shotTimings.get(id);
-          const tmTag = tm ? `, len=${tm.len}f, vignette@t=${tm.key}f` : '';
+          const tmTag = tm ? `, ${(tm.len / 30).toFixed(1)}s (${tm.len}f)` : '';
           return `- ${s.id} [${s.size ?? 'medium'}, set=${s.set ?? 'custom'}${tmTag}]: "${s.note ?? ''}"`;
         })
         .join('\n');
@@ -589,8 +643,7 @@ export async function callMcpTool(
     const cardsBlock = cardsText ? `\n\n## Fiches de mise en scène\n${cardsText.slice(0, 16_000)}` : '';
     const sizeDrift = directorSizeMismatches(directorRaw, ep);
     const autoMetrics = [
-      staticMetrics(epSrc),
-      accentMetrics(epSrc),
+      diffusionMetrics(epSrc, bibleRes.bible, epLang),
       timingMetrics(timeline),
       sizeDrift.length ? `écarts de taille DIRECTOR.md ↔ episode.json (${sizeDrift.length}) : ${sizeDrift.join(', ')}` : '',
     ]
@@ -609,6 +662,19 @@ export async function callMcpTool(
       if (!relativeImagePaths.length) {
         relativeImagePaths = sheetFiles.map((n) => `out/${slug}/sheets/${n}`);
       }
+      const targetRefs = new Set<string>();
+      for (const id of deltaTargetShots) {
+        const sp = epSrc.shots.get(id);
+        if (!sp) continue;
+        for (const c of sp.characters) {
+          const rel = `out/${slug}/refs/char_${c}.png`;
+          if (fs.existsSync(path.join(projectRoot, rel))) targetRefs.add(rel);
+        }
+        const relPlace = `out/${slug}/refs/place_${sp.place}.png`;
+        if (fs.existsSync(path.join(projectRoot, relPlace))) targetRefs.add(relPlace);
+      }
+      relativeImagePaths.push(...targetRefs);
+
       const targetSet = new Set(deltaTargetShots);
       const prevIssuesList = prevErrors
         .map((iss) => `- [${iss.shot}] Problème signalé : ${iss.problem}\n  Correctif demandé : ${iss.fix}`)
@@ -622,26 +688,27 @@ export async function callMcpTool(
         `## 2. Script complet (narration ${langUpper})\n${scriptLines.slice(0, 22_000)}`,
         `## 3. Découpage des plans ciblés\n${formatShotBreakdown(targetSet)}`,
         wordMarks.length ? `## 4. Repères mot@frame\n${wordMarks.join('\n')}` : '',
-        bibleRaw ? `## 5. Bible\n${bibleRaw.slice(0, 3_000)}` : '',
+        bibleRaw ? `## 5. Bible de continuité (bible.json)\n${bibleRaw.slice(0, 6_000)}` : '',
         `## 6. Note de réalisation (DIRECTOR.md)\n${directorRaw.slice(0, 14_000)}${cardsBlock}`,
-        `## 7. Code COMPLET non tronqué des plans ciblés\n${summarizeShotsCode(epSrc, { onlyShots: deltaTargetShots, shotTimings, perShotChars: 8_000 })}`,
+        `## 7. Specs JSON complètes des plans ciblés (shots/S*.json)\n${summarizeShotPrompts(epSrc, { onlyShots: deltaTargetShots, shotTimings, perShotChars: 4_000 })}`,
       ]
         .filter(Boolean)
         .join('\n\n');
     } else {
-      relativeImagePaths = sheetFiles.length
+      const boardImgs = sheetFiles.length
         ? sheetFiles.map((n) => `out/${slug}/sheets/${n}`)
         : fs.existsSync(path.join(outDir, 'storyboard.jpg'))
           ? [`out/${slug}/storyboard.jpg`]
           : [];
+      relativeImagePaths = [...allRefRelPaths, ...boardImgs];
       systemPrompt = reviewerSystemPrompt(epLang);
       dossier = [
         `# Audit indépendant (Tour ${round}, mode=global) de "${slug}" (orientation: ${aspect}, langue: ${langUpper}, defaultSet: ${JSON.stringify(ep?.defaultSet ?? '')})`,
         `## 1. Script complet (narration ${langUpper})\n${scriptLines.slice(0, 22_000)}`,
         `## 2. Découpage des plans (episode.json.shots)\n${formatShotBreakdown().slice(0, 22_000)}`,
-        bibleRaw ? `## 3. Bible\n${bibleRaw.slice(0, 3_000)}` : '',
+        bibleRaw ? `## 3. Bible de continuité (bible.json)\n${bibleRaw.slice(0, 8_000)}` : '',
         `## 4. Note de réalisation (DIRECTOR.md)\n${directorRaw.slice(0, 14_000)}${cardsBlock}`,
-        `## 5. Code des plans\n${summarizeShotsCode(epSrc, { shotTimings, perShotChars: 2_600 })}`,
+        `## 5. Specs JSON des plans (shots/S*.json)\n${summarizeShotPrompts(epSrc, { shotTimings, perShotChars: 1_800 })}`,
         `## 6. Mesures automatiques\n${autoMetrics}`,
       ]
         .filter(Boolean)

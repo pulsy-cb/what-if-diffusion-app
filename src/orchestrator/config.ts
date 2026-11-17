@@ -9,6 +9,7 @@ export type Config = {
   dataRoot: string;
   dbPath: string;
   projectsDir: string;
+  /** Kept nullable/optional for backward compatibility; the diffusion studio is fully self-contained. */
   skillDir: string | null;
   webDir: string;
   authToken: string | null;
@@ -21,26 +22,9 @@ export type Config = {
   approvalsMode: 'off' | 'pipeline' | 'all';
   /** Local TTS/translation API (the "nouveau" app), the one the videos and their takes live in. */
   nouveauUrl: string;
-  /** "modal" (default) renders on Modal, "local" falls back to npx remotion inside this container. */
-  renderMode: 'modal' | 'local';
   /** Maximum number of independent reviewer feedback rounds per episode before letting the pipeline proceed. */
   reviewMaxRounds: number;
 };
-
-/** Find the upstream skill folder: env first, then a sibling clone of this app. */
-function detectSkillDir(): string | null {
-  const env = process.env.WHATIF_SKILL_DIR;
-  if (env && fs.existsSync(path.join(env, 'studio'))) return path.resolve(env);
-  const here = path.dirname(new URL(import.meta.url).pathname);
-  const root = path.resolve(here, '..', '..');
-  for (const candidate of [
-    path.join(path.dirname(root), 'what-if-animation'),
-    path.join(root, 'what-if-animation'),
-  ]) {
-    if (fs.existsSync(path.join(candidate, 'studio'))) return candidate;
-  }
-  return null;
-}
 
 function intEnv(raw: string | undefined, fallback: number, min = 0): number {
   if (raw === undefined || raw.trim() === '') return fallback;
@@ -75,11 +59,11 @@ export function loadConfig(): Config {
   return {
     host: process.env.WHATIF_HOST?.trim() || '127.0.0.1',
     allowedOrigins: parseAllowedOrigins(process.env.WHATIF_ALLOWED_ORIGINS),
-    port: intEnv(process.env.WHATIF_PORT, 3000, 0),
+    port: intEnv(process.env.WHATIF_PORT, 3020, 0),
     dataRoot,
     dbPath,
     projectsDir: path.join(dataRoot, 'projects'),
-    skillDir: detectSkillDir(),
+    skillDir: null,
     webDir: path.join(packageRoot, 'web', 'public'),
     authToken: process.env.WHATIF_AUTH_TOKEN?.trim() || null,
     maxSteps: intEnv(process.env.WHATIF_MAX_STEPS, 1_000, 1),
@@ -91,7 +75,6 @@ export function loadConfig(): Config {
       return raw === 'all' ? 'all' : raw === 'pipeline' || raw === 'on' ? 'pipeline' : 'off';
     })(),
     nouveauUrl: (process.env.WHATIF_NOUVEAU_URL?.trim() || 'http://127.0.0.1:8005').replace(/\/$/, ''),
-    renderMode: process.env.WHATIF_RENDER === 'local' ? 'local' : 'modal',
     reviewMaxRounds: intEnv(process.env.WHATIF_REVIEW_MAX_ROUNDS, 3, 0),
   };
 }

@@ -106,27 +106,27 @@ export async function layoutReport(dir: string, onlyIds?: string[]): Promise<str
     if (box.fill < 0.06) {
       failedIds.push(id);
       empty.push(
-        `${id} is nearly blank (${(box.fill * 100).toFixed(1)}% ink): check that keyframes fire before the shot's key/len (t is in frames, not seconds) and camera zoom is 1.0–2.4`,
+        `${id} is nearly blank (${(box.fill * 100).toFixed(1)}% ink/contrast): refine imagePrompt via edit_shot so foreground subjects, background set, and contrast fill the frame`,
       );
     } else if (box.x1 - box.x0 < 0.35) {
       failedIds.push(id);
-      empty.push(`${id} only spans x ${box.x0.toFixed(2)}-${box.x1.toFixed(2)}: drawing is crushed into a strip`);
+      empty.push(`${id} only spans x ${box.x0.toFixed(2)}-${box.x1.toFixed(2)}: subject and scenery are crushed into a narrow strip — adjust framing in imagePrompt`);
     } else if (box.x1 < 0.65 || box.rightFill < 0.04) {
       failedIds.push(id);
       empty.push(
-        `${id} leaves the right half dead (x ends at ${box.x1.toFixed(2)}, right ink ${(box.rightFill * 100).toFixed(0)}%): rebalance it: an off-centre subject on a third is fine if the other half holds set, light or props (world centre is x=960, never 640)`,
+        `${id} leaves the right half dead (x ends at ${box.x1.toFixed(2)}, right contrast ${(box.rightFill * 100).toFixed(0)}%): rebalance composition in imagePrompt so the right side holds set details, lighting, or props`,
       );
     } else if (box.x0 > 0.35 || box.leftFill < 0.04) {
       failedIds.push(id);
       empty.push(
-        `${id} leaves the left half dead (x starts at ${box.x0.toFixed(2)}, left ink ${(box.leftFill * 100).toFixed(0)}%): rebalance it: an off-centre subject on a third is fine if the other half holds set, light or props`,
+        `${id} leaves the left half dead (x starts at ${box.x0.toFixed(2)}, left contrast ${(box.leftFill * 100).toFixed(0)}%): rebalance composition in imagePrompt so the left side holds set details, lighting, or props`,
       );
     } else if (box.y1 - box.y0 < 0.28 || box.bottomFill < 0.02 || box.topFill < 0.02) {
       warn.push(
-        `${id} has unbalanced vertical framing (y ${box.y0.toFixed(2)}-${box.y1.toFixed(2)}, top ${(box.topFill * 100).toFixed(0)}% / bottom ${(box.bottomFill * 100).toFixed(0)}%): adjust cy/zoom in camT so the floor or ceiling does not swallow half the frame`,
+        `${id} has unbalanced vertical framing (y ${box.y0.toFixed(2)}-${box.y1.toFixed(2)}, top ${(box.topFill * 100).toFixed(0)}% / bottom ${(box.bottomFill * 100).toFixed(0)}%): adjust angle/framing in imagePrompt so floor or sky does not swallow half the frame`,
       );
     } else if (box.fill < 0.12) {
-      warn.push(`${id} is sparse (${(box.fill * 100).toFixed(0)}% ink): add props, labels or a closer framing`);
+      warn.push(`${id} is sparse (${(box.fill * 100).toFixed(0)}% contrast): enrich set dressing or bring the camera closer in imagePrompt`);
     }
   }
   if (!lines.length) return '';

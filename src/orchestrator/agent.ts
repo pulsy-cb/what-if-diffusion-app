@@ -7,6 +7,7 @@ import type { Db } from './db.js';
 import type { Approvals } from './approvals.js';
 import type { ToolRegistry, ToolResult, ToolContext } from '../tools/index.js';
 import type { Provider } from './providers/types.js';
+import { mediaEnvForSubprocess } from './media-providers.js';
 import { activeEpisodeSlug, buildMessages, pipelineTodo, shotWordFrames, toolMessageContent } from './context.js';
 import { clearReviewBlock, extractReviewShotIds, formatReviewFeedback, giveUpReview, refusedUnchanged, reopenReview, reviewEpisodeBoard, reviewStageCards } from './reviewer.js';
 import { pickImages } from './image-pick.js';
@@ -40,6 +41,7 @@ export async function runTurn(deps: AgentDeps, threadId: string, signal: AbortSi
     projectRoot: project.root,
     dataRoot: config.dataRoot,
     skillDir: config.skillDir,
+    mediaEnv: mediaEnvForSubprocess(db, process.env, config.dataRoot),
     log: (line) => bus.emit(threadId, 'log', { line }),
     signal,
   };
@@ -125,12 +127,39 @@ export async function runTurn(deps: AgentDeps, threadId: string, signal: AbortSi
       bus.emit(threadId, 'thinking', { step: step + 1 });
       const history = db.listMessages(threadId);
       const messages = buildMessages({ projectRoot: project.root, history, maxChars: config.contextChars });
-      const res = await provider.chat({
-        messages,
-        tools: registry.schemas(),
-        signal,
-        onText: (delta) => bus.emit(threadId, 'assistant_delta', { text: delta }),
-      });
+      let res!: Awaited<ReturnType<Provider['chat']>>;
+      for (let chatTry = 1; chatTry <= 3; chatTry++) {
+        try {
+          res = await provider.chat({
+            messages,
+            tools: registry.schemas(),
+            signal,
+            onText: (delta) => bus.emit(threadId, 'assistant_delta', { text: delta }),
+          });
+          break;
+        } catch (chatErr) {
+          const msg = errText(chatErr);
+          const transient =
+            !signal.aborted &&
+            /\b(terminated|timeout|idle timeout|ECONNRESET|EAI_AGAIN|fetch failed|socket hang up|502|503|504)\b/i.test(msg);
+          if (!transient || chatTry >= 3) throw chatErr;
+          const waitMs = 5_000 * chatTry;
+          bus.emit(threadId, 'notice', {
+            text: `[orchestrateur] Erreur réseau/stream LLM (${msg.slice(0, 120)}), nouvelle tentative ${chatTry}/2 dans ${waitMs / 1000}s...`,
+          });
+          await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(() => {
+              signal.removeEventListener('abort', onAbort);
+              resolve();
+            }, waitMs);
+            const onAbort = () => {
+              clearTimeout(timer);
+              reject(new Error('aborted'));
+            };
+            signal.addEventListener('abort', onAbort, { once: true });
+          });
+        }
+      }
 
       if (!res.toolCalls.length && (res.truncatedToolCall || res.finishReason === 'length' || !res.text.trim())) {
         // Save partial text if the model wrote real text before hitting max_tokens without tool calls
@@ -140,8 +169,8 @@ export async function runTurn(deps: AgentDeps, threadId: string, signal: AbortSi
         }
         emptyTurns++;
         const note = res.truncatedToolCall
-          ? `[orchestrateur] L'appel d'outil "${res.truncatedToolCall}" a été coupé par la limite de tokens (sortie trop volumineuse en un seul appel). Pour écrire shots.tsx sur un épisode long, écris d'abord l'en-tête et les 6-8 premiers plans avec write_file ({ path, content }), puis ajoute les plans suivants par lots de 6-8 avec write_file ({ path, content, append: true }). Reprends immédiatement.`
-          : `[orchestrateur] Réponse coupée par le budget de tokens (${provider.model}, WHATIF_MAX_TOKENS=${config.maxTokens}). Ne réfléchis pas trop longtemps avant d'agir : écris shots.tsx par lots de 6-8 plans avec write_file (puis append: true pour la suite).`;
+          ? `[orchestrateur] L'appel d'outil "${res.truncatedToolCall}" a été coupé par la limite de tokens (sortie trop volumineuse en un seul appel). Pour les longs épisodes, écris la bible avec write_bible puis envoie les specs JSON des plans par lots de 4–6 avec edit_shot ({ episode, shots: [...] }). Reprends immédiatement.`
+          : `[orchestrateur] Réponse coupée par le budget de tokens (${provider.model}, WHATIF_MAX_TOKENS=${config.maxTokens}). Ne réfléchis pas trop longtemps avant d'agir : écris write_bible puis envoie les plans par lots de 4–6 via edit_shot.`;
         bus.emit(threadId, 'notice', { text: note });
         db.addMessage(threadId, 'user', note);
         if (emptyTurns <= 5) continue;
@@ -198,7 +227,7 @@ export async function runTurn(deps: AgentDeps, threadId: string, signal: AbortSi
           nudges++;
           const nudge =
             `[orchestrateur] La chaîne n'est pas terminée (étapes restantes : ${todo.join(', ')}). ` +
-            `Appelle directement l'outil suivant maintenant (pour un shots.tsx de plus de 10 plans, écris-le par lots de 6-8 plans avec write_file puis write_file { append: true }).`;
+            `Appelle directement l'outil suivant maintenant (write_bible, stage_shots, edit_shot par lots de 4–6 plans JSON, ou whatif_run).`;
           db.addMessage(threadId, 'user', nudge);
           bus.emit(threadId, 'notice', { text: nudge });
           continue;
@@ -371,7 +400,7 @@ export async function runTurn(deps: AgentDeps, threadId: string, signal: AbortSi
             !isLayoutCheck &&
             call.name === 'whatif_run' &&
             // source: a :8005 failure (video without audio, server down) is not something the agent can fix
-            ['render', 'master', 'stills', 'source'].includes(String(call.args?.step ?? ''))
+            ['refs', 'stills', 'clips', 'render', 'master', 'upscale', 'source'].includes(String(call.args?.step ?? ''))
           ) {
             const stage = String(call.args.step);
             const errLines = result.summary.split('\n').filter((l) => l.trim());
@@ -441,22 +470,22 @@ export async function runTurn(deps: AgentDeps, threadId: string, signal: AbortSi
             if (a.kind === 'image' && IMAGE_PATH.test(a.path)) producedImages.push(a.path);
           }
 
-          const isEpEdit = call.name === 'edit_shot' || /^src\/episodes\//.test(String(call.args?.path ?? ''));
-          if (result.ok && isEpEdit && ['edit_shot', 'write_file', 'edit_file'].includes(call.name)) renderAsksRefused = 0;
-          if (!result.ok && call.name === 'whatif_run' && String(call.args?.step ?? '') === 'render' && /the independent reviewer refused this board/.test(String(result.summary ?? ''))) {
+          const isEpEdit = call.name === 'edit_shot' || call.name === 'write_bible' || /^src\/episodes\//.test(String(call.args?.path ?? ''));
+          if (result.ok && isEpEdit && ['edit_shot', 'write_bible', 'write_file', 'edit_file'].includes(call.name)) renderAsksRefused = 0;
+          if (!result.ok && call.name === 'whatif_run' && ['clips', 'render'].includes(String(call.args?.step ?? '')) && /the independent reviewer refused this board/.test(String(result.summary ?? ''))) {
             renderAsksRefused++;
             const renderSlug = String(call.args?.episode ?? '').trim();
             const firstRefused = (String(result.summary).match(/\[(S\d+)/) ?? [])[1] ?? 'the first refused shot';
             if (renderAsksRefused === 2) {
               // the long list was read eight times in a row without one edit (custom, 2026-11-13): say the one next call
-              const note = `[orchestrateur] Rien n'a changé depuis le refus du Reviewer : redemander render donne la même réponse. Ton prochain appel doit être edit_shot sur ${firstRefused} (puis stills des plans modifiés, puis board). Si tu redemandes render sans rien corriger, la vidéo sortira avec ses défauts.`;
+              const note = `[orchestrateur] Rien n'a changé depuis le refus du Reviewer : redemander ${String(call.args?.step ?? 'clips')} donne la même réponse. Ton prochain appel doit être edit_shot sur ${firstRefused} (puis stills des plans modifiés, puis board). Si tu redemandes sans rien corriger, la vidéo sortira avec ses défauts.`;
               heldNotes.push(note);
               bus.emit(threadId, 'notice', { text: note });
             } else if (renderAsksRefused >= 3 && renderSlug) {
               const defects = giveUpReview(project.root, renderSlug);
               if (defects) {
                 reviewRounds = config.reviewMaxRounds;
-                const note = `[orchestrateur] Render demandé ${renderAsksRefused} fois sans corriger un seul plan refusé : la revue est close, la vidéo sort avec ses défauts (${defects}). Relance whatif_run { step: "render" } maintenant, et cite ce fichier dans ton résumé.`;
+                const note = `[orchestrateur] ${String(call.args?.step ?? 'clips')} demandé ${renderAsksRefused} fois sans corriger un seul plan refusé : la revue est close, la vidéo sort avec ses défauts (${defects}). Relance whatif_run { step: "${String(call.args?.step ?? 'clips')}" } maintenant, et cite ce fichier dans ton résumé.`;
                 heldNotes.push(note);
                 bus.emit(threadId, 'notice', { text: note });
               }
@@ -575,7 +604,7 @@ export async function runTurn(deps: AgentDeps, threadId: string, signal: AbortSi
       // Guard against pure read-only loops (e.g. re-reading episode.json / shared.tsx step after step without acting)
       const stepHadAction = res.toolCalls.some((c) => {
         const t = registry.get(c.name);
-        return Boolean(t?.mutating) || ['whatif_run', 'whatif_new', 'stage_shots', 'edit_shot', 'write_file', 'edit_file', 'shell'].includes(c.name);
+        return Boolean(t?.mutating) || ['whatif_run', 'whatif_new', 'stage_shots', 'write_bible', 'edit_shot', 'write_file', 'edit_file', 'shell'].includes(c.name);
       });
       if (stepHadAction) {
         readOnlyStreak = 0;
@@ -584,7 +613,7 @@ export async function runTurn(deps: AgentDeps, threadId: string, signal: AbortSi
         if (readOnlyStreak === 8) {
           const roNote =
             `[orchestrateur] Tu viens d'effectuer ${readOnlyStreak} étapes consécutives de lecture seule sans modifier aucun fichier. ` +
-            `Ne relis plus episode.json ni shared.tsx : exécute immédiatement la prochaine action d'écriture ou de pipeline (write_file DIRECTOR.md, stage_shots, write_file shared.tsx / shots/S<N>.tsx, ou whatif_run).`;
+            `Ne relis plus episode.json ni bible.json : exécute immédiatement la prochaine action d'écriture ou de pipeline (write_file DIRECTOR.md, write_bible, stage_shots, edit_shot pour shots/S<N>.json, ou whatif_run).`;
           db.addMessage(threadId, 'user', roNote);
           bus.emit(threadId, 'notice', { text: roNote });
         } else if (readOnlyStreak >= 16) {

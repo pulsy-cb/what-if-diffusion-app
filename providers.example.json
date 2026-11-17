@@ -1,11 +1,13 @@
 {
-  // Catalogue multi-fournisseurs & multi-modèles (rechargé à chaud sans redémarrer ni toucher au .env).
+  // Catalogue multi-fournisseurs LLM & Diffusion Média (rechargé à chaud sans redémarrer ni toucher au .env).
   // Copie ce fichier vers `providers.json` (à la racine ou dans `data/providers.json`), puis active (`"enabled": true`)
-  // ou ajoute autant de fournisseurs et de modèles que tu veux.
+  // ou ajoute autant de fournisseurs LLM et APIs Image/Vidéo que tu veux.
   //
-  // Optionnel : définir le fournisseur / modèle global par défaut (si non forcé dans l'interface ⚙)
+  // Optionnel : définir les défauts globaux (si non forcés dans l'interface ⚙)
   // "defaultProvider": "openrouter-perso",
   // "defaultReviewProvider": "openrouter-perso",
+  // "defaultImageProvider": "gflow-nano",
+  // "defaultVideoProvider": "gflow-omni",
 
   "providers": {
     "openrouter-perso": {
@@ -13,53 +15,19 @@
       "label": "OpenRouter (Multi-modèles)",
       "driver": "openai",
       "baseURL": "https://openrouter.ai/api/v1",
-      // Clé directe ("sk-or-v1-...") OU variable d'environnement ("$OPENROUTER_API_KEY" / "$WHATIF_API_KEY")
       "apiKey": "$WHATIF_API_KEY",
       "defaultModel": "anthropic/claude-sonnet-4.5",
       "reviewModel": "google/gemini-2.5-pro",
       "discoverModels": false,
       "models": [
         { "id": "anthropic/claude-sonnet-4.5", "label": "Claude Sonnet 4.5", "supportsVision": true },
-        { "id": "google/gemini-2.5-pro", "label": "Gemini 2.5 Pro (Vision)", "supportsVision": true },
-        { "id": "deepseek/deepseek-chat-v3-0324", "label": "DeepSeek V3", "supportsVision": false },
-        { "id": "qwen/qwen3-coder", "label": "Qwen 3 Coder", "supportsVision": false }
-      ]
-    },
-
-    "mon-proxy-ia": {
-      "enabled": true,
-      "label": "Mon Proxy API Compatible OpenAI",
-      "driver": "openai",
-      "baseURL": "https://api.mon-proxy.example.com/v1",
-      "apiKey": "sk-votre-cle-ici",
-      "defaultModel": "glm-5",
-      "reviewModel": "qwen2.5-vl-72b-instruct",
-      // Mets `true` si tu veux AUSSI interroger automatiquement `${baseURL}/models` en plus de la liste ci-dessous :
-      "discoverModels": false,
-      "models": [
-        "glm-5",
-        "deepseek-v3.2",
-        { "id": "qwen2.5-vl-72b-instruct", "label": "Qwen 2.5 VL 72B (Reviewer Vision)", "supportsVision": true }
-      ]
-    },
-
-    "claude-direct": {
-      "enabled": false,
-      "label": "Anthropic Direct (Claude)",
-      "driver": "anthropic",
-      "baseURL": "https://api.anthropic.com",
-      "apiKey": "$ANTHROPIC_API_KEY",
-      "defaultModel": "claude-sonnet-4-5",
-      "reviewModel": "claude-sonnet-4-5",
-      "models": [
-        "claude-sonnet-4-5",
-        "claude-opus-4-5"
+        { "id": "google/gemini-2.5-pro", "label": "Gemini 2.5 Pro (Vision)", "supportsVision": true }
       ]
     },
 
     "gemini-direct": {
       "enabled": false,
-      "label": "Google Gemini API",
+      "label": "Google Gemini API (Agent & Reviewer)",
       "driver": "openai",
       "baseURL": "https://generativelanguage.googleapis.com/v1beta/openai",
       "apiKey": "$GEMINI_API_KEY",
@@ -69,6 +37,83 @@
         { "id": "gemini-2.5-pro", "label": "Gemini 2.5 Pro", "supportsVision": true },
         { "id": "gemini-2.5-flash", "label": "Gemini 2.5 Flash", "supportsVision": true }
       ]
+    }
+  },
+
+  // --- APIs de Diffusion (Image = Nano Banana 2 Lite / 2.1, Vidéo = Omni 1.2 Flash 360p sur :8006) ---
+  "mediaProviders": {
+    "gflow-nano": {
+      "enabled": true,
+      "role": "image",
+      "label": "gflow :8006 — Nano Banana 2 Lite (fallback 2.1)",
+      "driver": "gflow",
+      "baseURL": "http://127.0.0.1:8006",
+      "model": "nano2-lite",
+      "fallbackModel": "nano2.1",
+      "refMode": "multi",
+      "maxRefs": 10,
+      "endpointPath": "/v1/images/generations"
+    },
+
+    "gflow-omni": {
+      "enabled": true,
+      "role": "video",
+      "label": "gflow :8006 — Omni 1.2 Flash 360p (I2V + SFX)",
+      "driver": "gflow",
+      "baseURL": "http://127.0.0.1:8006",
+      "model": "omni-1.2-flash",
+      "resolution": "360p",
+      "endpointPath": "/v1/videos/generations",
+      "pollPath": "/v1/jobs/{id}"
+    },
+
+    "gemini-media-direct": {
+      "enabled": false,
+      "role": "both",
+      "label": "Google Gemini API directe (Nano Banana 2 Lite + Omni Flash)",
+      "driver": "gemini",
+      "baseURL": "https://generativelanguage.googleapis.com/v1beta",
+      "apiKey": "$GEMINI_API_KEY",
+      "refMode": "multi",
+      "maxRefs": 4,
+      "image": {
+        "model": "gemini-3.1-flash-lite-image"
+      },
+      "video": {
+        "model": "gemini-omni-flash-2.1"
+      }
+    },
+
+    "custom-http-gateway": {
+      "enabled": false,
+      "role": "both",
+      "label": "Passerelle HTTP générique (REST / Webhook)",
+      "driver": "http",
+      "baseURL": "https://media-proxy.example.com",
+      "apiKey": "$MEDIA_API_KEY",
+      "headers": {
+        "Authorization": "Bearer $MEDIA_API_KEY"
+      },
+      "refMode": "multi",
+      "endpointPath": "/v1/generate",
+      "pollPath": "/v1/jobs/{id}",
+      "responsePaths": {
+        "url": "output.url",
+        "b64": "output.base64",
+        "jobId": "job_id",
+        "status": "status"
+      }
+    },
+
+    "upscaler": {
+      "enabled": false,
+      "label": "Anime 2D Video Upscaler (Modal Real-CUGAN / Real-ESRGAN)",
+      "driver": "modal-anime",
+      "baseURL": "https://bkrpulsy--anime-upscaler-t4-fastapi-app.modal.run",
+      "target": "auto-2k",
+      "model": "real-cugan",
+      "denoiseLevel": 1,
+      "gpuType": "L40S"
     }
   }
 }

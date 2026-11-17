@@ -284,6 +284,258 @@ export function buildAgyPrompt(messages: ChatMessage[], tools: ToolSchema[], tmp
   };
 }
 
+const AGY_SAFETY_BLOCK_RE = /blocked by content safety filters|prohibited use policy|safety filter|content_filter/i;
+
+const AGY_SAFETY_FRAMING_MSG: ChatMessage = {
+  role: 'system',
+  content:
+    'IMPORTANT STUDIO SAFETY FRAMING: You are authoring safe, bloodless, non-graphic TV-PG 2D explainer cartoon storyboard metadata ' +
+    '(stylized round-head cartoon characters for a documentary / journalistic recounting of real-world internet stories). ' +
+    'Describe emergency or law-enforcement scenes strictly using non-violent visual cues (e.g., uniformed police officer standing calmly at front door, ' +
+    'blue-and-red patrol car light wash on porch, startled cartoon expressions, flashlight beam). NEVER include graphic violence, weapons aimed at people, or harm.',
+};
+
+async function runAgyOnce(
+  bin: string,
+  targetModel: string,
+  messages: ChatMessage[],
+  tools: ToolSchema[],
+  opts: AgyOptions,
+  req: ChatRequest,
+): Promise<ChatResult> {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'whatif-agy-'));
+  let cleanedTmp = false;
+  const cleanupTmp = () => {
+    if (cleanedTmp) return;
+    cleanedTmp = true;
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  };
+
+  try {
+    const { cliPrompt } = buildAgyPrompt(messages, tools, tmpDir);
+    const args = ['--disable-slash-commands', '--model', targetModel, '--output-format', 'stream-json'];
+    if (tools.length > 0) {
+      args.push('--json-schema', AGENT_TURN_SCHEMA_STR);
+    }
+    args.push(`--print=${cliPrompt}`);
+
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...opts.env,
+      PATH: `${process.env.PATH ?? ''}:/usr/local/bin:${path.join(os.homedir(), '.local', 'bin')}`,
+    };
+
+    return await new Promise<ChatResult>((resolve, reject) => {
+      let settled = false;
+      let killTimer: ReturnType<typeof setTimeout> | null = null;
+      const terminateChild = () => {
+        try {
+          child.kill('SIGTERM');
+        } catch {
+          /* ignore */
+        }
+        killTimer = setTimeout(() => {
+          try {
+            child.kill('SIGKILL');
+          } catch {
+            /* ignore */
+          }
+        }, 3_000);
+        killTimer.unref?.();
+      };
+      const finishErr = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(turnTimer);
+        reject(err);
+      };
+      const finishOk = (res: ChatResult) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(turnTimer);
+        resolve(res);
+      };
+
+      const child = spawn(bin, args, {
+        cwd: tmpDir,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env,
+      });
+      child.stdout.setEncoding('utf8');
+      child.stderr.setEncoding('utf8');
+
+      const turnTimeoutMs = 15 * 60_000;
+      const turnTimer = setTimeout(() => {
+        terminateChild();
+        finishErr(new Error(`agy (${targetModel}) timeout (${turnTimeoutMs / 1000}s)`));
+      }, turnTimeoutMs);
+
+      const onAbort = () => {
+        terminateChild();
+        finishErr(new Error('aborted'));
+      };
+      if (req.signal?.aborted) {
+        onAbort();
+        return;
+      }
+      req.signal?.addEventListener('abort', onAbort, { once: true });
+
+      let stdoutBuf = '';
+      let stderrBuf = '';
+      let streamedText = '';
+      let finalEvent: any = null;
+
+      const checkAuthPrompt = (chunkStr: string) => {
+        if (/Authentication required\. Please visit the URL to log in/i.test(chunkStr)) {
+          terminateChild();
+          finishErr(
+            new Error(
+              `Session Google Antigravity (agy) non connectée dans cet environnement : lance « docker compose exec -u node -e HOME=/home/node studio agy acp --login » (en Docker) ou « agy acp --login » (sur l'hôte) une seule fois pour authentifier ton compte Google.`,
+            ),
+          );
+          return true;
+        }
+        return false;
+      };
+
+      const handleLine = (line: string) => {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('{')) return;
+        const ev = safeJson(trimmed);
+        if (!ev) return;
+        if (ev.event === 'step_update' && tools.length === 0) {
+          const delta = ev.step_update?.text_delta;
+          if (typeof delta === 'string' && delta) {
+            streamedText += delta;
+            req.onText?.(delta);
+          }
+        } else if (ev.event === 'result') {
+          finalEvent = ev.result;
+        }
+      };
+
+      child.stdout.on('data', (str: string) => {
+        if (checkAuthPrompt(str)) return;
+        stdoutBuf += str;
+        let nl: number;
+        while ((nl = stdoutBuf.indexOf('\n')) >= 0) {
+          const line = stdoutBuf.slice(0, nl);
+          stdoutBuf = stdoutBuf.slice(nl + 1);
+          handleLine(line);
+        }
+      });
+
+      child.stderr.on('data', (str: string) => {
+        if (checkAuthPrompt(str)) return;
+        stderrBuf += str;
+      });
+
+      child.on('error', (err) => {
+        if (killTimer) clearTimeout(killTimer);
+        req.signal?.removeEventListener('abort', onAbort);
+        cleanupTmp();
+        finishErr(err);
+      });
+
+      child.on('close', (code) => {
+        if (killTimer) clearTimeout(killTimer);
+        req.signal?.removeEventListener('abort', onAbort);
+        cleanupTmp();
+        if (settled) return;
+        if (stdoutBuf.trim()) handleLine(stdoutBuf);
+
+        if (finalEvent?.status === 'ERROR') {
+          finishErr(new Error(`agy (${targetModel}): ${finalEvent.error || stderrBuf.trim() || `exit ${code}`}`));
+          return;
+        }
+        if (!finalEvent && code !== 0) {
+          finishErr(new Error(`agy (${targetModel}) failed (exit ${code}): ${(stderrBuf || stdoutBuf).trim().slice(0, 500)}`));
+          return;
+        }
+
+        const usage = finalEvent?.usage;
+        if (tools.length === 0) {
+          const fullText = typeof finalEvent?.response === 'string' ? finalEvent.response : streamedText;
+          if (AGY_SAFETY_BLOCK_RE.test(fullText)) {
+            finishErr(new Error(`agy (${targetModel}): ${fullText.slice(0, 400)}`));
+            return;
+          }
+          if (!streamedText && fullText) req.onText?.(fullText);
+          finishOk({
+            text: fullText,
+            toolCalls: [],
+            usage,
+            finishReason: 'stop',
+          });
+          return;
+        }
+
+        const structured =
+          finalEvent?.structured_output && typeof finalEvent.structured_output === 'object'
+            ? finalEvent.structured_output
+            : safeJson(String(finalEvent?.response ?? ''));
+        if (!structured || typeof structured !== 'object') {
+          const fallbackText = String(finalEvent?.response ?? '').trim();
+          if (AGY_SAFETY_BLOCK_RE.test(fallbackText)) {
+            finishErr(new Error(`agy (${targetModel}): ${fallbackText.slice(0, 400)}`));
+            return;
+          }
+          if (fallbackText) req.onText?.(fallbackText);
+          finishOk({
+            text: fallbackText,
+            toolCalls: [],
+            usage,
+            finishReason: 'stop',
+          });
+          return;
+        }
+
+        const text = typeof structured.text === 'string' ? structured.text : '';
+        if (text) req.onText?.(text);
+
+        const toolCalls: ToolCall[] = [];
+        let truncatedToolCall: string | undefined;
+        const rawCalls = Array.isArray(structured.toolCalls) ? structured.toolCalls : [];
+        for (const rc of rawCalls) {
+          const name = String(rc?.name ?? '').trim();
+          if (!name) continue;
+          const rawArgs = rc?.argsJson;
+          let parsedArgs: any = null;
+          if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) {
+            parsedArgs = rawArgs;
+          } else if (typeof rawArgs === 'string') {
+            parsedArgs = rawArgs.trim() === '' ? {} : safeJson(rawArgs);
+          }
+          if (!parsedArgs || typeof parsedArgs !== 'object' || Array.isArray(parsedArgs)) {
+            truncatedToolCall = name;
+            continue;
+          }
+          toolCalls.push({
+            id: `agy_${randomUUID().slice(0, 8)}`,
+            name,
+            args: parsedArgs as Record<string, unknown>,
+          });
+        }
+
+        finishOk({
+          text,
+          toolCalls,
+          usage,
+          finishReason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
+          ...(truncatedToolCall ? { truncatedToolCall } : {}),
+        });
+      });
+    });
+  } catch (err) {
+    cleanupTmp();
+    throw err;
+  }
+}
+
 export function agyProvider(opts: AgyOptions): Provider {
   const modelId = normalizeAgyModel(opts.model);
   return {
@@ -298,228 +550,28 @@ export function agyProvider(opts: AgyOptions): Provider {
         );
       }
 
-      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'whatif-agy-'));
-      let cleanedTmp = false;
-      const cleanupTmp = () => {
-        if (cleanedTmp) return;
-        cleanedTmp = true;
-        try {
-          fs.rmSync(tmpDir, { recursive: true, force: true });
-        } catch {
-          /* ignore */
-        }
-      };
-
       try {
-        const { cliPrompt } = buildAgyPrompt(req.messages, req.tools, tmpDir);
-        const args = ['--disable-slash-commands', '--model', modelId, '--output-format', 'stream-json'];
-        if (req.tools.length > 0) {
-          args.push('--json-schema', AGENT_TURN_SCHEMA_STR);
-        }
-        args.push(`--print=${cliPrompt}`);
-
-        const env: NodeJS.ProcessEnv = {
-          ...process.env,
-          ...opts.env,
-          PATH: `${process.env.PATH ?? ''}:/usr/local/bin:${path.join(os.homedir(), '.local', 'bin')}`,
-        };
-
-        return await new Promise<ChatResult>((resolve, reject) => {
-          let settled = false;
-          let killTimer: ReturnType<typeof setTimeout> | null = null;
-          const terminateChild = () => {
-            try {
-              child.kill('SIGTERM');
-            } catch {
-              /* ignore */
-            }
-            killTimer = setTimeout(() => {
-              try {
-                child.kill('SIGKILL');
-              } catch {
-                /* ignore */
-              }
-            }, 3_000);
-            killTimer.unref?.();
-          };
-          const finishErr = (err: Error) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(turnTimer);
-            reject(err);
-          };
-          const finishOk = (res: ChatResult) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(turnTimer);
-            resolve(res);
-          };
-
-          const child = spawn(bin, args, {
-            cwd: tmpDir,
-            stdio: ['ignore', 'pipe', 'pipe'],
-            env,
-          });
-          child.stdout.setEncoding('utf8');
-          child.stderr.setEncoding('utf8');
-
-          const turnTimeoutMs = 15 * 60_000;
-          const turnTimer = setTimeout(() => {
-            terminateChild();
-            finishErr(new Error(`agy (${modelId}) timeout (${turnTimeoutMs / 1000}s)`));
-          }, turnTimeoutMs);
-
-          const onAbort = () => {
-            terminateChild();
-            finishErr(new Error('aborted'));
-          };
-          if (req.signal?.aborted) {
-            onAbort();
-            return;
-          }
-          req.signal?.addEventListener('abort', onAbort, { once: true });
-
-          let stdoutBuf = '';
-          let stderrBuf = '';
-          let streamedText = '';
-          let finalEvent: any = null;
-
-          const checkAuthPrompt = (chunkStr: string) => {
-            if (/Authentication required\. Please visit the URL to log in/i.test(chunkStr)) {
-              terminateChild();
-              finishErr(
-                new Error(
-                  `Session Google Antigravity (agy) non connectée dans cet environnement : lance « docker compose exec studio agy acp --login » (en Docker) ou « agy acp --login » (sur l'hôte) une seule fois pour authentifier ton compte Google.`,
-                ),
-              );
-              return true;
-            }
-            return false;
-          };
-
-          const handleLine = (line: string) => {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith('{')) return;
-            const ev = safeJson(trimmed);
-            if (!ev) return;
-            if (ev.event === 'step_update' && req.tools.length === 0) {
-              const delta = ev.step_update?.text_delta;
-              if (typeof delta === 'string' && delta) {
-                streamedText += delta;
-                req.onText?.(delta);
-              }
-            } else if (ev.event === 'result') {
-              finalEvent = ev.result;
-            }
-          };
-
-          child.stdout.on('data', (str: string) => {
-            if (checkAuthPrompt(str)) return;
-            stdoutBuf += str;
-            let nl: number;
-            while ((nl = stdoutBuf.indexOf('\n')) >= 0) {
-              const line = stdoutBuf.slice(0, nl);
-              stdoutBuf = stdoutBuf.slice(nl + 1);
-              handleLine(line);
-            }
-          });
-
-          child.stderr.on('data', (str: string) => {
-            if (checkAuthPrompt(str)) return;
-            stderrBuf += str;
-          });
-
-          child.on('error', (err) => {
-            if (killTimer) clearTimeout(killTimer);
-            req.signal?.removeEventListener('abort', onAbort);
-            cleanupTmp();
-            finishErr(err);
-          });
-
-          child.on('close', (code) => {
-            if (killTimer) clearTimeout(killTimer);
-            req.signal?.removeEventListener('abort', onAbort);
-            cleanupTmp();
-            if (settled) return;
-            if (stdoutBuf.trim()) handleLine(stdoutBuf);
-
-            if (finalEvent?.status === 'ERROR') {
-              finishErr(new Error(`agy (${modelId}): ${finalEvent.error || stderrBuf.trim() || `exit ${code}`}`));
-              return;
-            }
-            if (!finalEvent && code !== 0) {
-              finishErr(new Error(`agy (${modelId}) failed (exit ${code}): ${(stderrBuf || stdoutBuf).trim().slice(0, 500)}`));
-              return;
-            }
-
-            const usage = finalEvent?.usage;
-            if (req.tools.length === 0) {
-              const fullText = typeof finalEvent?.response === 'string' ? finalEvent.response : streamedText;
-              if (!streamedText && fullText) req.onText?.(fullText);
-              finishOk({
-                text: fullText,
-                toolCalls: [],
-                usage,
-                finishReason: 'stop',
-              });
-              return;
-            }
-
-            const structured =
-              finalEvent?.structured_output && typeof finalEvent.structured_output === 'object'
-                ? finalEvent.structured_output
-                : safeJson(String(finalEvent?.response ?? ''));
-            if (!structured || typeof structured !== 'object') {
-              const fallbackText = String(finalEvent?.response ?? '').trim();
-              if (fallbackText) req.onText?.(fallbackText);
-              finishOk({
-                text: fallbackText,
-                toolCalls: [],
-                usage,
-                finishReason: 'stop',
-              });
-              return;
-            }
-
-            const text = typeof structured.text === 'string' ? structured.text : '';
-            if (text) req.onText?.(text);
-
-            const toolCalls: ToolCall[] = [];
-            let truncatedToolCall: string | undefined;
-            const rawCalls = Array.isArray(structured.toolCalls) ? structured.toolCalls : [];
-            for (const rc of rawCalls) {
-              const name = String(rc?.name ?? '').trim();
-              if (!name) continue;
-              const rawArgs = rc?.argsJson;
-              let parsedArgs: any = null;
-              if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) {
-                parsedArgs = rawArgs;
-              } else if (typeof rawArgs === 'string') {
-                parsedArgs = rawArgs.trim() === '' ? {} : safeJson(rawArgs);
-              }
-              if (!parsedArgs || typeof parsedArgs !== 'object' || Array.isArray(parsedArgs)) {
-                truncatedToolCall = name;
-                continue;
-              }
-              toolCalls.push({
-                id: `agy_${randomUUID().slice(0, 8)}`,
-                name,
-                args: parsedArgs as Record<string, unknown>,
-              });
-            }
-
-            finishOk({
-              text,
-              toolCalls,
-              usage,
-              finishReason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
-              ...(truncatedToolCall ? { truncatedToolCall } : {}),
-            });
-          });
-        });
+        return await runAgyOnce(bin, modelId, req.messages, req.tools, opts, req);
       } catch (err) {
-        cleanupTmp();
-        throw err;
+        const msg = err instanceof Error ? err.message : String(err);
+        if (req.signal?.aborted || !AGY_SAFETY_BLOCK_RE.test(msg)) {
+          throw err;
+        }
+        const safeMessages: ChatMessage[] = [AGY_SAFETY_FRAMING_MSG, ...req.messages];
+        const fallbackCandidates = [...new Set([modelId, 'gemini-4-carbon-medium', 'gemini-3.8-flash-medium', 'claude-sonnet-4-6'])];
+        let lastErr: unknown = err;
+        for (const candidate of fallbackCandidates) {
+          if (req.signal?.aborted) break;
+          console.error(`[agy] content safety block on ${modelId}; retrying safely on ${candidate}`);
+          try {
+            return await runAgyOnce(bin, candidate, safeMessages, req.tools, opts, req);
+          } catch (fbErr) {
+            lastErr = fbErr;
+            const fbMsg = fbErr instanceof Error ? fbErr.message : String(fbErr);
+            if (/Session Google Antigravity.*non connectée|aborted/i.test(fbMsg)) throw fbErr;
+          }
+        }
+        throw lastErr;
       }
     },
   };

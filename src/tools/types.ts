@@ -27,8 +27,10 @@ export type ToolContext = {
   /** The studio folder of the project: contains src/episodes, public/, out/. */
   projectRoot: string;
   dataRoot: string;
-  /** Skill folder (the upstream what-if-animation repo) used to scaffold and to run its scripts. */
-  skillDir: string | null;
+  /** Deprecated optional path (studio is now self-contained; kept optional for compatibility). */
+  skillDir?: string | null;
+  /** Resolved image & video diffusion provider environment variables for subprocesses. */
+  mediaEnv?: NodeJS.ProcessEnv;
   log: (line: string) => void;
   signal?: AbortSignal;
 };
@@ -45,8 +47,11 @@ export type Tool = {
   run: (input: any, ctx: ToolContext) => Promise<ToolResult>;
 };
 
+export type JsonSchemaPrimitive = 'object' | 'string' | 'number' | 'integer' | 'boolean' | 'array' | 'null';
+
 export type JsonSchema = {
-  type?: 'object' | 'string' | 'number' | 'integer' | 'boolean' | 'array';
+  type?: JsonSchemaPrimitive | JsonSchemaPrimitive[];
+  nullable?: boolean;
   description?: string;
   properties?: Record<string, JsonSchema>;
   required?: string[];
@@ -60,21 +65,34 @@ export function validateSchema(schema: JsonSchema, value: unknown, path = '$'): 
   const errors: string[] = [];
   if (!schema || typeof schema !== 'object') return errors;
 
+  const allowsNull =
+    schema.nullable === true ||
+    schema.type === 'null' ||
+    (Array.isArray(schema.type) && schema.type.includes('null'));
+  if (value === null) {
+    if (allowsNull) return errors;
+  }
+
   if (schema.enum && !schema.enum.some((v) => v === value)) {
     errors.push(`${path}: must be one of ${schema.enum.map((v) => JSON.stringify(v)).join(', ')}`);
   }
-  switch (schema.type) {
+  const primaryType = Array.isArray(schema.type) ? schema.type.find((t) => t !== 'null') : schema.type;
+  switch (primaryType) {
     case 'object': {
       if (value === null || typeof value !== 'object' || Array.isArray(value)) {
         errors.push(`${path}: expected an object`);
         break;
       }
       const obj = value as Record<string, unknown>;
+      const reqSet = new Set(schema.required ?? []);
       for (const req of schema.required ?? []) {
         if (obj[req] === undefined) errors.push(`${path}.${req}: required`);
       }
       for (const [key, sub] of Object.entries(schema.properties ?? {})) {
-        if (obj[key] !== undefined) errors.push(...validateSchema(sub, obj[key], `${path}.${key}`));
+        if (obj[key] === undefined) continue;
+        // Treat explicit `null` on optional non-enum fields (common in Codex/OpenAI structured calls) as omitted.
+        if (obj[key] === null && !reqSet.has(key) && !sub.enum) continue;
+        errors.push(...validateSchema(sub, obj[key], `${path}.${key}`));
       }
       if (schema.additionalProperties === false) {
         for (const key of Object.keys(obj)) {

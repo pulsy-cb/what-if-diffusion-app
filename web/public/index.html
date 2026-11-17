@@ -240,6 +240,129 @@
         <label id="s-key-wrap">Clé API (inutile pour codex et agy)
           <input id="s-key" type="password" placeholder="(inchangée)" autocomplete="off" />
         </label>
+        <div class="dialog-head" style="margin-top:8px;">
+          <h3 style="margin:0;font-size:14px;">Diffusion Image (Storyboard &amp; Références)</h3>
+          <p class="muted small" style="margin:2px 0 0;">Nano Banana 2 Lite par défaut (fallback / option <code>nano2.1</code>) via Google Flow <code>:8006</code>, Gemini, OpenAI, HTTP custom ou mock.</p>
+        </div>
+        <div class="form-grid-2">
+          <label>Driver Image
+            <select id="s-img-provider"></select>
+          </label>
+          <label>Modèle Image
+            <input id="s-img-model" list="dl-img-models" placeholder="nano2-lite" />
+            <datalist id="dl-img-models">
+              <option value="nano2-lite">Nano Banana 2 Lite (défaut rapide, max 3 refs)</option>
+              <option value="nano2.1">Nano Banana 2.1 (fallback / haute précision, max 10 refs)</option>
+              <option value="nano-pro">Nano Banana Pro</option>
+              <option value="image4">Imagen 4</option>
+            </datalist>
+          </label>
+        </div>
+        <div class="form-grid-2">
+          <label>Base URL Image
+            <input id="s-img-baseurl" placeholder="http://127.0.0.1:8006" />
+          </label>
+          <label>Mode Références
+            <select id="s-img-refmode">
+              <option value="multi">multi (plusieurs images — natif :8006)</option>
+              <option value="composite">composite (1 planche groupée)</option>
+              <option value="none">none (texte seul)</option>
+            </select>
+          </label>
+        </div>
+        <label>Clé API Image (facultative si locale / providers.json)
+          <input id="s-img-key" type="password" placeholder="(inchangée)" autocomplete="off" />
+        </label>
+        <div class="dialog-head" style="margin-top:8px;">
+          <h3 style="margin:0;font-size:14px;">Diffusion Vidéo Image-to-Video + SFX</h3>
+          <p class="muted small" style="margin:2px 0 0;"><code>omni-1.2-flash</code> en <code>360p</code> par défaut via <code>:8006</code> (génère le mouvement I2V + bruitages sans dialogue ni musique).</p>
+        </div>
+        <div class="form-grid-2">
+          <label>Driver Vidéo
+            <select id="s-vid-provider"></select>
+          </label>
+          <label>Modèle Vidéo I2V
+            <input id="s-vid-model" list="dl-vid-models" placeholder="omni-1.2-flash" />
+            <datalist id="dl-vid-models">
+              <option value="omni-1.2-flash">Omni 1.2 Flash (défaut, 3-15s, 360p/720p)</option>
+              <option value="omni-flash">Omni Flash 1.1</option>
+              <option value="veo-lite">Veo 3.1 Lite</option>
+              <option value="veo-fast">Veo 3.1 Fast</option>
+              <option value="veo-quality">Veo 3.1 Quality</option>
+            </datalist>
+          </label>
+        </div>
+        <div class="form-grid-2">
+          <label>Résolution Vidéo générée
+            <select id="s-vid-resolution">
+              <option value="360p">360p — Rapide gflow Omni 1.2 (idéal avant upscale)</option>
+              <option value="720p">720p — HD Omni</option>
+              <option value="1080p">1080p — Full HD (autres drivers)</option>
+            </select>
+          </label>
+          <label>Base URL Vidéo
+            <input id="s-vid-baseurl" placeholder="http://127.0.0.1:8006" />
+          </label>
+        </div>
+        <div class="form-grid-2">
+          <label>Endpoint Vidéo (optionnel)
+            <input id="s-vid-endpoint" placeholder="/v1/videos/generations" />
+          </label>
+          <label>Clé API Vidéo (facultative)
+            <input id="s-vid-key" type="password" placeholder="(inchangée)" autocomplete="off" />
+          </label>
+        </div>
+        <div class="dialog-head" style="margin-top:8px;">
+          <h3 style="margin:0;font-size:14px;">Upscaler Anime 2D (Optionnel — Modal Real-CUGAN / Real-ESRGAN)</h3>
+          <p class="muted small" style="margin:2px 0 0;">Rehausse les rendus 360p/720p en 2K (1440p) ou 4K UHD (2160p) en fin de rendu, tout en conservant les lignes 2D et l'audio -14 LUFS.</p>
+        </div>
+        <div class="form-grid-2">
+          <label>Upscale automatique en fin de rendu
+            <select id="s-up-enabled">
+              <option value="false">Désactivé (manuel / désactivé)</option>
+              <option value="true">Activé automatiquement après render</option>
+            </select>
+          </label>
+          <label>Cible de sortie
+            <select id="s-up-target">
+              <option value="auto-2k">2K QHD (1440p — 360p×4 / 720p×2)</option>
+              <option value="auto-uhd">4K UHD (2160p — 720p×3 / 1080p×2)</option>
+              <option value="auto-1080p">Full HD (1080p — 360p×3 / 720p×2)</option>
+              <option value="2x">Facteur fixe 2×</option>
+              <option value="3x">Facteur fixe 3×</option>
+              <option value="4x">Facteur fixe 4×</option>
+            </select>
+          </label>
+        </div>
+        <div class="form-grid-2">
+          <label>Modèle Upscaler 2D
+            <select id="s-up-model">
+              <option value="real-cugan">real-cugan (recommandé 2D ligne nette)</option>
+              <option value="realesr-animevideov3">realesr-animevideov3 (rapide vidéo animée)</option>
+              <option value="realesrgan-x2plus">realesrgan-x2plus</option>
+              <option value="realesrgan-x4plus">realesrgan-x4plus</option>
+            </select>
+          </label>
+          <label>Débruitage (Denoise)
+            <select id="s-up-denoise">
+              <option value="1">1 — Léger (recommandé)</option>
+              <option value="0">0 — Aucun</option>
+              <option value="2">2 — Fort</option>
+            </select>
+          </label>
+        </div>
+        <div class="form-grid-2">
+          <label>GPU Modal
+            <select id="s-up-gpu">
+              <option value="L40S">L40S (48 Go — recommandé)</option>
+              <option value="A100-40GB">A100-40GB</option>
+              <option value="L4">L4</option>
+            </select>
+          </label>
+          <label>Endpoint Upscaler Modal
+            <input id="s-up-baseurl" placeholder="https://bkrpulsy--anime-upscaler-t4-fastapi-app.modal.run" />
+          </label>
+        </div>
         <label>Token d'accès serveur (facultatif)
           <input id="s-token" type="password" placeholder="(facultatif)" autocomplete="off" />
         </label>
@@ -247,7 +370,7 @@
         <p id="s-env-status" class="info-callout small" hidden></p>
         <p id="s-codex-status" class="info-callout small" hidden></p>
         <p id="s-agy-status" class="info-callout small" hidden></p>
-        <p id="s-skill" class="muted small"></p>
+        <p id="s-media-status" class="muted small"></p>
         <menu>
           <button value="cancel" class="ghost">Annuler</button>
           <button id="s-save" value="save" class="primary">Enregistrer</button>

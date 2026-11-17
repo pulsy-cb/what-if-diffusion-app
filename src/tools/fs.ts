@@ -1,35 +1,39 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { exec } from './exec.js';
 import type { Tool, ToolResult } from './types.js';
 import {
-  exportedSymbols, globToRegExp, isBinaryPath, mimeOf, readText, relOf, safeJoin, walk,
+  exportedSymbols,
+  globToRegExp,
+  isBinaryPath,
+  mimeOf,
+  readText,
+  relOf,
+  safeJoin,
+  walk,
 } from './paths.js';
 import {
-  normalizeSharedEpisodeFile,
-  normalizeShotTagJsx,
-  prepareModularShotFile,
+  VALID_CAMERA_MOVES,
+  VALID_ONSCREEN_KINDS,
+  VALID_SHOT_ANGLES,
+  VALID_SHOT_VIEWS,
+  readEpisodeBible,
   readEpisodeShots,
-  replaceShotMonolithic,
-  syncShotsBarrel,
+  sortShotIds,
+  validateBible,
+  validateShotSpec,
+  type DiffusionShotSpec,
 } from './episode-source.js';
-
-const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 /**
  * Where the agent may write inside a project: its episodes, notes at the root (PROJECT.md…) and scratch files in out/.
- * Everything else (the engine, studio config, exports, package manifests, scripts, git internals, .env) is refused: a
- * model that mis-targets a path used to overwrite studio files (src/exports/, src/engine) and lose them.
- * Engine edits stay possible when the operator sets WHATIF_ALLOW_ENGINE_WRITES=1 (e.g. to extend a set on request).
+ * Everything else (package manifests, scripts, git internals, .env, providers.json) is refused.
  */
 const WRITABLE_PATHS = [/^src\/episodes\//, /^[^/]+\.md$/, /^out\//];
-const ENGINE_PATHS = /^src\/(engine|exports)\//;
 
 function assertWritableProjectPath(projectRoot: string, relPath: string): { abs: string; rel: string } {
   const raw = relPath.replace(/\\/g, '/').replace(/^\/+/, '');
   if (/\(exports:|\[compacted/i.test(raw)) {
-    throw new Error(`writing to "${raw}" is refused: pass the clean file path (e.g. "src/episodes/<slug>/shots.tsx") without annotations`);
+    throw new Error(`writing to "${raw}" is refused: pass the clean file path without annotations`);
   }
   const abs = safeJoin(projectRoot, relPath);
   const norm = relOf(projectRoot, abs);
@@ -38,108 +42,94 @@ function assertWritableProjectPath(projectRoot: string, relPath: string): { abs:
     norm === 'package.json' ||
     norm === 'package-lock.json' ||
     norm.startsWith('scripts/') ||
+    norm.startsWith('pipeline/') ||
     norm.startsWith('.git/') ||
     /(^|\/)\.env(\.|$)/i.test(norm) ||
     /(^|\/)providers\.json$/i.test(norm)
   ) {
     throw new Error(`writing to "${norm || raw}" is refused by security policy`);
   }
-  // Enforce uppercase S<N>.tsx inside shots/ so Linux case-sensitive imports never break the barrel
-  const shotCase = /^src\/episodes\/[^/]+\/shots\/(s\d+)\.tsx$/i.exec(norm);
-  if (shotCase && shotCase[1] !== shotCase[1]!.toUpperCase()) {
-    throw new Error(`shot file "${norm}" must use uppercase "${shotCase[1]!.toUpperCase()}.tsx"`);
+  const shotMatch = /^src\/episodes\/[^/]+\/shots\/([^/]+)$/i.exec(norm);
+  if (shotMatch) {
+    const file = shotMatch[1]!;
+    if (!/^S\d+\.json$/i.test(file)) {
+      throw new Error(`shot file "${norm}" must be a JSON prompt spec named "S<N>.json" (not TSX or arbitrary files)`);
+    }
+    const stem = file.replace(/\.json$/i, '');
+    if (stem !== stem.toUpperCase() || !file.endsWith('.json')) {
+      throw new Error(`shot file "${norm}" must use uppercase "${stem.toUpperCase()}.json"`);
+    }
   }
   if (WRITABLE_PATHS.some((re) => re.test(norm))) return { abs, rel: norm };
-  if (process.env.WHATIF_ALLOW_ENGINE_WRITES === '1' && ENGINE_PATHS.test(norm)) return { abs, rel: norm };
   throw new Error(
-    `writing to "${norm}" is refused: write inside src/episodes/<slug>/ (shots.tsx, index.tsx, DIRECTOR.md…), a root note like PROJECT.md, or out/. ` +
-      `The engine (src/engine) is shared by every episode and is not edited by the agent.`,
+    `writing to "${norm}" is refused: write inside src/episodes/<slug>/ (episode.json, DIRECTOR.md, bible.json, shots/S<N>.json…), a root note like PROJECT.md, or out/.`,
   );
 }
 
 function assertNotCompactedPlaceholder(text: string, toolName: string): void {
   if (/\[compacted:\s*\d+\s*lines/i.test(text)) {
     throw new Error(
-      `${toolName} refused: content contains a "[compacted: ...]" placeholder instead of real code. Write the actual TypeScript/JSX code for the shots.`,
+      `${toolName} refused: content contains a "[compacted: ...]" placeholder instead of real data. Write the complete JSON or Markdown content.`,
     );
   }
 }
 
-/**
- * Normalize episode TSX files on write/edit:
- * - `shots.tsx`: `<shot>` -> `<Shot>`
- * - `shared.tsx`: `<shot>` -> `<Shot>` + auto-export top-level shared places/cast/helpers
- * - `shots/S<N>.tsx`: auto-import `React`, `'../../../engine'`, `'../shared'` + `<shot>` -> `<Shot>`
- */
-function normalizeEpisodeTsx(projectRoot: string, relPath: string, code: string): string {
-  const norm = relPath.replace(/\\/g, '/').replace(/^\/+/, '');
-  if (/^src\/episodes\/[^/]+\/shots\.tsx$/.test(norm)) {
-    return normalizeShotTagJsx(code);
-  }
-  if (/^src\/episodes\/[^/]+\/shared\.tsx$/.test(norm)) {
-    return normalizeSharedEpisodeFile(code);
-  }
-  const shotMatch = /^src\/episodes\/([^/]+)\/shots\/(S\d+)\.tsx$/i.exec(norm);
-  if (shotMatch) {
-    const epDir = path.join(projectRoot, 'src', 'episodes', shotMatch[1]!);
-    return prepareModularShotFile(projectRoot, epDir, shotMatch[2]!.toUpperCase(), code);
-  }
-  return code;
-}
-
-/** Auto-rebuild barrel `shots.tsx` (and `index.tsx` shot map) whenever `shared.tsx` or `shots/S<N>.tsx` changes. */
-function maybeSyncEpisodeBarrel(projectRoot: string, relPath: string): void {
-  const norm = relPath.replace(/\\/g, '/').replace(/^\/+/, '');
-  const m = /^src\/episodes\/([^/]+)\/(?:shared\.tsx|shots\/S\d+\.tsx)$/i.exec(norm);
-  if (!m) return;
-  const epDir = path.join(projectRoot, 'src', 'episodes', m[1]!);
-  const epSrc = readEpisodeShots(epDir);
-  if (epSrc.isModular) {
-    syncShotsBarrel(epDir);
-  }
-}
-
-/**
- * Fast local TypeScript check when an episode's shots, shared.tsx, or index.tsx is written/edited and node_modules exists.
- * Catches syntax/prop errors immediately before a slow Modal round-trip.
- */
-async function quickEpisodeTypecheck(projectRoot: string, relPath: string): Promise<string> {
-  const norm = relPath.replace(/\\/g, '/').replace(/^\/+/, '');
-  const m = /^src\/episodes\/([^/]+)\/(?:shots|shared|index|shots\/S\d+)\.tsx$/i.exec(norm);
-  if (!m) return '';
-  const slug = m[1]!;
-  if (!fs.existsSync(path.join(projectRoot, 'node_modules'))) return '';
-  const projTsc = path.join(projectRoot, 'node_modules', '.bin', 'tsc');
-  const appTsc = path.join(APP_ROOT, 'node_modules', '.bin', 'tsc');
-  const tscBin = fs.existsSync(projTsc) ? projTsc : fs.existsSync(appTsc) ? appTsc : '';
-  if (!tscBin) return '';
-
-  // Only run tsc once all timeline shots are exported (skip intermediate batches while shots are still being added)
-  try {
-    const epDir = path.join(projectRoot, 'src', 'episodes', slug);
-    const tl = JSON.parse(fs.readFileSync(path.join(epDir, 'timeline.json'), 'utf8'));
-    const epSrc = readEpisodeShots(epDir);
-    if (epSrc.isPlaceholder) return '';
-    const exported = new Set(epSrc.exportedShotIds);
-    const wanted: string[] = (tl?.shots ?? []).map((s: any) => String(s?.id ?? '')).filter(Boolean);
-    if (wanted.some((id) => !exported.has(id))) {
-      return '';
+/** Validate bible.json or shots/S<N>.json when written or edited directly via write_file / edit_file. */
+function validateStructuredEpisodeJson(projectRoot: string, normPath: string, content: string): string {
+  if (/^src\/episodes\/[^/]+\/bible\.json$/.test(normPath)) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(content);
+    } catch (e) {
+      throw new Error(`invalid JSON in ${normPath}: ${(e as Error).message}`);
     }
-  } catch {
-    /* run check anyway */
+    const { bible, errors } = validateBible(parsed);
+    if (!bible || errors.length) {
+      throw new Error(`${normPath} failed validation:\n- ${errors.join('\n- ')}`);
+    }
+    return JSON.stringify(bible, null, 2) + '\n';
   }
+  const shotMatch = /^src\/episodes\/([^/]+)\/shots\/(S\d+)\.json$/.exec(normPath);
+  if (shotMatch) {
+    const slug = shotMatch[1]!;
+    const id = shotMatch[2]!;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(content);
+    } catch (e) {
+      throw new Error(`invalid JSON in ${normPath}: ${(e as Error).message}`);
+    }
+    const { shot, errors } = validateShotSpec(parsed, id);
+    if (!shot || errors.length) {
+      throw new Error(`${normPath} failed validation:\n- ${errors.join('\n- ')}`);
+    }
+    const bibleErrs = checkShotAgainstBible(path.join(projectRoot, 'src', 'episodes', slug), shot);
+    if (bibleErrs.length) {
+      throw new Error(`${normPath} does not match bible.json:\n- ${bibleErrs.join('\n- ')}`);
+    }
+    return JSON.stringify(shot, null, 2) + '\n';
+  }
+  return content;
+}
 
-  const res = await exec([tscBin, '-p', 'tsconfig.json', '--noEmit', '--pretty', 'false'], {
-    cwd: projectRoot,
-    timeoutMs: 25_000,
-  });
-  if (res.code === 0) return '\n[tsc] OK (0 TypeScript errors)';
-  const out = `${res.stdout}\n${res.stderr}`
-    .split('\n')
-    .filter((l) => l.includes(`src/episodes/${slug}/`) || /error TS\d+/.test(l))
-    .slice(0, 15)
-    .join('\n');
-  return out ? `\n[tsc] TypeScript errors detected — fix before running stills/render:\n${out}` : '';
+function checkShotAgainstBible(epDir: string, shot: DiffusionShotSpec): string[] {
+  const { exists, bible, errors } = readEpisodeBible(epDir);
+  if (!exists) return [];
+  if (!bible || errors.length) {
+    return [`bible.json is invalid (${errors[0] ?? 'parse error'}) — fix it with write_bible first`];
+  }
+  const errs: string[] = [];
+  const placeIds = new Set(bible.places.map((p) => p.id));
+  const charIds = new Set(bible.characters.map((c) => c.id));
+  if (!placeIds.has(shot.place)) {
+    errs.push(`${shot.id}.place "${shot.place}" is not in bible.json.places (available: ${[...placeIds].join(', ')})`);
+  }
+  for (const cid of shot.characters) {
+    if (!charIds.has(cid)) {
+      errs.push(`${shot.id}.characters "${cid}" is not in bible.json.characters (available: ${[...charIds].join(', ') || 'none'})`);
+    }
+  }
+  return errs;
 }
 
 const repoMap: Tool = {
@@ -155,10 +145,11 @@ const repoMap: Tool = {
     },
   },
   async run(input: { maxFiles?: number; filter?: string }, ctx) {
-    // the cap applies to what is listed, after the filter: capping the walk first answered "Episodes: none yet" on a
-    // finished project ({ maxFiles: 3, filter: 'PROJECT.md' }), and the agent took the episode for done (2026-11-13)
     const files = walk(ctx.projectRoot, { maxFiles: 5000 });
-    const selected = (input.filter ? files.filter((f) => f.includes(input.filter!)) : files).slice(0, Math.max(1, input.maxFiles ?? 300));
+    const selected = (input.filter ? files.filter((f) => f.includes(input.filter!)) : files).slice(
+      0,
+      Math.max(1, input.maxFiles ?? 300),
+    );
     const lines: string[] = [];
     let chars = 0;
     for (const rel of selected) {
@@ -210,7 +201,7 @@ const readFile: Tool = {
   },
   async run(input: { path: string; start?: number; end?: number; limit?: number }, ctx) {
     const normRel = relOf(ctx.projectRoot, safeJoin(ctx.projectRoot, input.path));
-    if (/(^|\/)\.env(\.|$)/i.test(normRel)) {
+    if (/(^|\/)\.env(\.|$)/i.test(normRel) || /(^|\/)providers\.json$/i.test(normRel)) {
       throw new Error(`reading "${normRel}" is refused by security policy`);
     }
     const src = readText(ctx.projectRoot, input.path, 2_000_000);
@@ -232,8 +223,7 @@ const readFile: Tool = {
 
 const writeFile: Tool = {
   name: 'write_file',
-  description:
-    'Create a file, replace it entirely, or append to it (when append: true). For large files like shots.tsx with 10+ shots, write the first 6-8 shots with write_file and append the remaining shots in batches of 6-8 with append: true.',
+  description: 'Create a file, replace it entirely, or append to it (when append: true).',
   policy: 'auto',
   mutating: true,
   schema: {
@@ -255,30 +245,25 @@ const writeFile: Tool = {
     if (input.append && existed) {
       const prev = fs.readFileSync(abs, 'utf8');
       const sep = prev.length > 0 && !prev.endsWith('\n') ? '\n' : '';
-      const combined = normalizeEpisodeTsx(ctx.projectRoot, normPath, prev + sep + input.content);
+      const combined = validateStructuredEpisodeJson(ctx.projectRoot, normPath, prev + sep + input.content);
       fs.writeFileSync(abs, combined, 'utf8');
-      maybeSyncEpisodeBarrel(ctx.projectRoot, normPath);
       const totalLines = combined.split('\n').length;
-      const tscNote = await quickEpisodeTypecheck(ctx.projectRoot, normPath);
       return {
         ok: true,
-        summary: `appended to ${normPath} (+${input.content.split('\n').length} lines, total ${totalLines} lines)${tscNote}`,
+        summary: `appended to ${normPath} (+${input.content.split('\n').length} lines, total ${totalLines} lines)`,
         data: { path: normPath, created: false, appended: true, lines: totalLines },
       };
     }
-    const content = normalizeEpisodeTsx(ctx.projectRoot, normPath, input.content);
+    const content = validateStructuredEpisodeJson(ctx.projectRoot, normPath, input.content);
     fs.writeFileSync(abs, content, 'utf8');
-    maybeSyncEpisodeBarrel(ctx.projectRoot, normPath);
     const lines = content.split('\n').length;
-    const tscNote = await quickEpisodeTypecheck(ctx.projectRoot, normPath);
     return {
       ok: true,
-      summary: `${existed ? 'replaced' : 'created'} ${normPath} (${lines} lines, ${Buffer.byteLength(content)} bytes)${tscNote}`,
+      summary: `${existed ? 'replaced' : 'created'} ${normPath} (${lines} lines, ${Buffer.byteLength(content)} bytes)`,
       data: { path: normPath, created: !existed, lines },
     };
   },
 };
-
 
 /** A whitespace-tolerant match: same text once leading indentation and blank lines are ignored. */
 function looseMatch(
@@ -298,7 +283,6 @@ function looseMatch(
     pos += line.length + 1;
   }
 
-  // One-line needle: the model usually misses the indentation, or quotes a fragment of a longer line.
   if (want.length === 1) {
     const hits: { at: number; end: number }[] = [];
     lines.forEach((line, i) => {
@@ -334,7 +318,6 @@ function looseMatch(
   return {
     start,
     end,
-    // keep the new text at the block's indentation so the patch looks like the file around it
     replace: (text: string) =>
       text
         .split('\n')
@@ -414,10 +397,6 @@ const editFile: Tool = {
     if (src === null) throw new Error(`cannot read ${input.path}`);
     let out = src;
     const applied: number[] = [];
-    const isShotsTsx = /(?:^|\/)shots\.tsx$/.test(normPath);
-    const shotsTip = isShotsTsx
-      ? '\nTip: for shots.tsx, prefer edit_shot (replaces one shot S<N> cleanly by ID) or send smaller single-shot edits.'
-      : '';
     for (let i = 0; i < input.edits.length; i++) {
       const { oldText, newText } = input.edits[i]!;
       const first = out.indexOf(oldText);
@@ -432,14 +411,13 @@ const editFile: Tool = {
             cursor = idx + Math.max(1, oldText.length);
           }
           throw new Error(
-            `edit ${i}: oldText is not unique in ${input.path} (matches at lines ${hitLines.join(', ')} — include surrounding lines to disambiguate).${shotsTip}`,
+            `edit ${i}: oldText is not unique in ${input.path} (matches at lines ${hitLines.join(', ')} — include surrounding lines to disambiguate).`,
           );
         }
         out = out.slice(0, first) + newText + out.slice(first + oldText.length);
         applied.push(first);
         continue;
       }
-      // Indentation and blank lines are what models get wrong; match on trimmed text instead of failing.
       const loose = looseMatch(out, oldText);
       if (loose) {
         out = out.slice(0, loose.start) + loose.replace(newText) + out.slice(loose.end);
@@ -451,17 +429,14 @@ const editFile: Tool = {
         `edit ${i}: oldText not found in ${input.path}.` +
           (near
             ? ` The closest text is lines ${near.line}-${near.endLine}:\n---\n${near.text}\n---\nCopy the exact lines you want to replace (indentation included).`
-            : ' Read the file and copy the text exactly.') +
-          shotsTip,
+            : ' Read the file and copy the text exactly.'),
       );
     }
-    const normalizedOut = normalizeEpisodeTsx(ctx.projectRoot, normPath, out);
-    fs.writeFileSync(abs, normalizedOut, 'utf8');
-    maybeSyncEpisodeBarrel(ctx.projectRoot, normPath);
-    const tscNote = await quickEpisodeTypecheck(ctx.projectRoot, normPath);
+    const validated = validateStructuredEpisodeJson(ctx.projectRoot, normPath, out);
+    fs.writeFileSync(abs, validated, 'utf8');
     return {
       ok: true,
-      summary: `${applied.length} edit(s) applied to ${normPath}${tscNote}`,
+      summary: `${applied.length} edit(s) applied to ${normPath}`,
       data: { path: normPath, edits: applied.length },
     };
   },
@@ -469,7 +444,7 @@ const editFile: Tool = {
 
 const glob: Tool = {
   name: 'glob',
-  description: 'List project files matching a glob (** and * supported), e.g. "src/episodes/**/shots.tsx".',
+  description: 'List project files matching a glob (** and * supported), e.g. "src/episodes/**/shots/*.json".',
   policy: 'auto',
   schema: {
     type: 'object',
@@ -542,7 +517,7 @@ const grep: Tool = {
 
 const viewImage: Tool = {
   name: 'view_image',
-  description: 'Open an image or short video from the project (a still, a storyboard sheet, a motion grid) so you can look at it.',
+  description: 'Open an image or short video from the project (a ref sheet, a still, a storyboard sheet, a motion grid) so you can look at it.',
   policy: 'auto',
   schema: {
     type: 'object',
@@ -562,96 +537,287 @@ const viewImage: Tool = {
   },
 };
 
-/**
- * Replace one shot of shots.tsx by its id, or add it when it is missing: the model sends the new shot only and never
- * has to read the file back to quote it exactly. AST-aware so neighboring local helpers and comments are preserved.
- */
-export function replaceShot(src: string, id: string, code: string): { text: string; replaced: boolean } {
-  return replaceShotMonolithic(src, id, code);
-}
-
-const editShot: Tool = {
-  name: 'edit_shot',
+const writeBible: Tool = {
+  name: 'write_bible',
   description:
-    'Write or replace one shot S<N> of an episode by its id (e.g. "S7"). On modular episodes (with shared.tsx / shots/), writes isolated `src/episodes/<episode>/shots/S7.tsx` (auto-importing shared places/cast and engine helpers) and syncs the `shots.tsx` barrel + `index.tsx`. On legacy single-file episodes, replaces `S7` cleanly inside `shots.tsx`. Pass `export const S7 = ...` (optionally preceded by shot-local helpers).',
+    'Write or update the episode visual continuity Bible (`src/episodes/<episode>/bible.json`): invariant 2D stylePrompt, negativePrompt, recurring characters (id, name, role, appearance, refPrompt), and places (id, name, recipe, description, refPrompt). Call this BEFORE `whatif_run { step: "refs" }` and BEFORE writing shot prompts with `edit_shot`.',
   policy: 'auto',
   mutating: true,
   schema: {
     type: 'object',
     properties: {
       episode: { type: 'string' },
-      id: { type: 'string', description: 'Shot id, e.g. "S7".' },
-      code: {
+      stylePrompt: {
         type: 'string',
-        description: 'The complete shot code exporting `export const S7 = ...` (local helpers like `const BEFORE = shot(...)` above `export const S7` are allowed).',
+        description: 'Invariant English 2D visual style prompt matching the channel aesthetic (flat 2D cartoon, crisp outlines, 3 depth layers, NO 3D, NO photorealism, NO title cards/subtitles).',
+      },
+      negativePrompt: {
+        type: 'string',
+        description: 'Optional negative prompt applied to every generated reference and still.',
+      },
+      characters: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'UPPERCASE_ID (e.g. MAYA, PROF)' },
+            name: { type: 'string' },
+            role: { type: 'string' },
+            appearance: { type: 'string', description: 'Detailed invariant English physical description: age, build, skin tone, hair style/color, exact outfit colors, distinguishing accessories.' },
+            refPrompt: { type: 'string', description: 'Optional extra guidance for generating the neutral full-body character reference sheet.' },
+          },
+          required: ['id', 'name', 'appearance'],
+          additionalProperties: false,
+        },
+      },
+      places: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'UPPERCASE_ID (e.g. CLASSROOM, LIVING)' },
+            name: { type: 'string' },
+            recipe: { type: 'string', description: 'Optional semantic set slug (e.g. classroom, living, corridor).' },
+            description: { type: 'string', description: 'Detailed invariant English description of walls, furniture layout, colors, and lighting.' },
+            refPrompt: { type: 'string', description: 'Optional extra guidance for generating the empty room reference image.' },
+          },
+          required: ['id', 'name', 'description'],
+          additionalProperties: false,
+        },
       },
     },
-    required: ['episode', 'id', 'code'],
+    required: ['episode', 'stylePrompt', 'characters', 'places'],
     additionalProperties: false,
   },
   validate: (input) => {
     const slug = String(input.episode ?? '').trim();
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(slug)) return 'episode must be a clean slug (letters, digits, hyphens, underscores)';
-    const id = String(input.id ?? '');
-    if (!/^S\d+$/.test(id)) return 'id must be a shot id like "S7"';
-    const code = String(input.code ?? '');
-    if (!new RegExp(`^\\s*export\\s+(?:const|function)\\s+${id}\\b`, 'm').test(code)) {
-      return `code must start with \`export const ${id} =\` (optionally preceded by local helpers or imports)`;
-    }
-    for (const m of code.matchAll(/^\s*export\s+(?:const|function)\s+(S\d+)\b/gm)) {
-      if (m[1] !== id) {
-        return `edit_shot writes one shot at a time: found \`export const ${m[1]}\` inside edit_shot for ${id}. Make a separate edit_shot call per shot.`;
-      }
-    }
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(slug)) return 'episode must be a clean slug';
     return null;
   },
-  async run(input: { episode: string; id: string; code: string }, ctx): Promise<ToolResult> {
+  async run(
+    input: {
+      episode: string;
+      stylePrompt: string;
+      negativePrompt?: string;
+      characters: unknown[];
+      places: unknown[];
+    },
+    ctx,
+  ): Promise<ToolResult> {
+    const slug = String(input.episode ?? '').trim();
+    const epRel = `src/episodes/${slug}`;
+    assertWritableProjectPath(ctx.projectRoot, `${epRel}/bible.json`);
+    const epDir = safeJoin(ctx.projectRoot, epRel);
+    if (!fs.existsSync(epDir)) {
+      throw new Error(`${epRel} does not exist yet: scaffold the episode first`);
+    }
+    const candidate = {
+      stylePrompt: input.stylePrompt,
+      ...(input.negativePrompt !== undefined ? { negativePrompt: input.negativePrompt } : {}),
+      characters: input.characters,
+      places: input.places,
+    };
+    assertNotCompactedPlaceholder(JSON.stringify(candidate), 'write_bible');
+    const { bible, errors } = validateBible(candidate);
+    if (!bible || errors.length) {
+      return {
+        ok: false,
+        summary: `bible.json rejected:\n- ${errors.join('\n- ')}`,
+      };
+    }
+    const biblePath = safeJoin(ctx.projectRoot, `${epRel}/bible.json`);
+    fs.writeFileSync(biblePath, JSON.stringify(bible, null, 2) + '\n', 'utf8');
+    return {
+      ok: true,
+      summary:
+        `Saved ${epRel}/bible.json (${bible.places.length} place(s): ${bible.places.map((p) => p.id).join(', ')}; ` +
+        `${bible.characters.length} character(s): ${bible.characters.map((c) => c.id).join(', ') || 'none'}). ` +
+        `Next: run whatif_run { episode: "${slug}", step: "refs" } to generate neutral reference sheets with Nano Banana 2 Lite.`,
+      data: {
+        path: `${epRel}/bible.json`,
+        places: bible.places.map((p) => p.id),
+        characters: bible.characters.map((c) => c.id),
+      },
+    };
+  },
+};
+
+const shotItemSchema = {
+  type: 'object' as const,
+  properties: {
+    id: { type: 'string' as const, description: 'Shot id, e.g. "S1".' },
+    place: { type: 'string' as const, description: 'Place ID from bible.json.places (e.g. "LIVING").' },
+    characters: {
+      type: 'array' as const,
+      items: { type: 'string' as const },
+      description: 'ONLY the character IDs from bible.json.characters actually visible in this shot ([] for empty room or macro object insert).',
+    },
+    size: { type: 'string' as const, description: '"wide" | "medium" | "close" | "insert" | "establishing"' },
+    angle: { type: 'string' as const, enum: [...VALID_SHOT_ANGLES] },
+    view: { type: 'string' as const, enum: [...VALID_SHOT_VIEWS] },
+    cameraMove: { type: 'string' as const, enum: [...VALID_CAMERA_MOVES] },
+    imagePrompt: {
+      type: 'string' as const,
+      description: 'Detailed English scene prompt for Nano Banana 2 Lite (framing, exact character poses, expressions, held/tabletop objects, NO title card, NO subtitles).',
+    },
+    imageModel: {
+      type: 'string' as const,
+      description: 'Optional per-shot image model override (e.g. "nano2.1" when a shot needs higher detail or >3 refs while keeping "nano2-lite" as default).',
+    },
+    negativePrompt: { type: 'string' as const },
+    onScreenText: {
+      type: ['object', 'null'] as ('object' | 'null')[],
+      description: 'Optional in-world diegetic text ONLY (phone SMS, document, sign, board) in the episode language. Pass null or omit if none. NEVER an episode title.',
+      properties: {
+        kind: { type: 'string' as const, enum: [...VALID_ONSCREEN_KINDS] },
+        text: { type: 'string' as const },
+        lang: { type: 'string' as const, enum: ['fr', 'en'] },
+      },
+      required: ['kind', 'text'],
+    },
+    videoPrompt: {
+      type: 'string' as const,
+      description: 'English Image-to-Video motion & camera prompt for Gemini Omni Flash 2.1 (single clean action matching shot duration, no cuts).',
+    },
+    sfxHint: {
+      type: 'string' as const,
+      description: 'Physical sound effects & room ambience for Gemini Omni Flash 2.1 (STRICTLY NO music, NO dialogue/voice).',
+    },
+    seed: { type: 'integer' as const },
+  },
+};
+
+const editShot: Tool = {
+  name: 'edit_shot',
+  description:
+    'Write or update diffusion prompt specs (`src/episodes/<episode>/shots/S<N>.json`) for Nano Banana 2 Lite (image) + Gemini Omni Flash 2.1 (I2V + SFX). Supports either a single shot (`{ episode, id, place, characters, imagePrompt, videoPrompt, sfxHint, ... }` or `{ episode, id, shot: {...} }`) OR a batch (`{ episode, shots: [...] }`).',
+  policy: 'auto',
+  mutating: true,
+  schema: {
+    type: 'object',
+    properties: {
+      episode: { type: 'string' },
+      id: { type: 'string', description: 'Shot id such as "S7" (required when updating a single shot without `shots`).' },
+      shot: { ...shotItemSchema, description: 'Single shot object (alternative to flat fields).' },
+      shots: {
+        type: 'array',
+        description: 'Batch of 1..15 shot spec objects to write at once.',
+        items: shotItemSchema,
+      },
+      place: shotItemSchema.properties.place,
+      characters: shotItemSchema.properties.characters,
+      size: shotItemSchema.properties.size,
+      angle: shotItemSchema.properties.angle,
+      view: shotItemSchema.properties.view,
+      cameraMove: shotItemSchema.properties.cameraMove,
+      imagePrompt: shotItemSchema.properties.imagePrompt,
+      imageModel: shotItemSchema.properties.imageModel,
+      negativePrompt: shotItemSchema.properties.negativePrompt,
+      onScreenText: shotItemSchema.properties.onScreenText,
+      videoPrompt: shotItemSchema.properties.videoPrompt,
+      sfxHint: shotItemSchema.properties.sfxHint,
+      seed: shotItemSchema.properties.seed,
+    },
+    required: ['episode'],
+    additionalProperties: false,
+  },
+  validate: (input) => {
     const slug = String(input.episode ?? '').trim();
     if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(slug)) {
-      throw new Error(`episode must be a clean slug, got "${slug}"`);
+      return 'episode must be a clean slug (letters, digits, hyphens, underscores)';
     }
+    const hasBatch = Array.isArray(input.shots) && input.shots.length > 0;
+    if (hasBatch) return null;
+    const id = String(input.id ?? (input.shot as any)?.id ?? '').trim().toUpperCase();
+    if (Array.isArray(input.shots) && !id) return 'shots array cannot be empty';
+    if (!/^S\d+$/.test(id)) return 'pass either `shots: [...]` or a single shot `id` like "S7"';
+    return null;
+  },
+  async run(input: Record<string, unknown>, ctx): Promise<ToolResult> {
+    const slug = String(input.episode ?? '').trim();
     const epRel = `src/episodes/${slug}`;
-    assertWritableProjectPath(ctx.projectRoot, `${epRel}/shots.tsx`);
-    assertNotCompactedPlaceholder(input.code, 'edit_shot');
+    assertWritableProjectPath(ctx.projectRoot, `${epRel}/shots/S1.json`);
     const epDir = safeJoin(ctx.projectRoot, epRel);
     if (!fs.existsSync(epDir)) {
       throw new Error(`${epRel} does not exist yet: scaffold the episode first`);
     }
 
-    const epSrc = readEpisodeShots(epDir);
-    // Modular mode: write isolated `src/episodes/<episode>/shots/<id>.tsx` and sync barrel `shots.tsx` + `index.tsx`
-    if (epSrc.isModular || !epSrc.exists || epSrc.isPlaceholder) {
-      const shotsDir = path.join(epDir, 'shots');
-      fs.mkdirSync(shotsDir, { recursive: true });
-      // Remove scaffold S1 placeholder if another shot is written first
-      if (input.id !== 'S1') {
-        const stubS1 = path.join(shotsDir, 'S1.tsx');
-        if (fs.existsSync(stubS1) && fs.readFileSync(stubS1, 'utf8').includes('SHOT S1 — PLACEHOLDER')) {
-          fs.unlinkSync(stubS1);
+    const candidates: { expectedId?: string; raw: Record<string, unknown> }[] = [];
+    if (Array.isArray(input.shots) && input.shots.length > 0) {
+      for (const item of input.shots) {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) {
+          return { ok: false, summary: 'every entry in shots[] must be a JSON object' };
         }
+        const obj = item as Record<string, unknown>;
+        const eid = typeof obj.id === 'string' ? obj.id.trim().toUpperCase() : undefined;
+        candidates.push({ expectedId: eid, raw: obj });
       }
-      const shotRel = `${epRel}/shots/${input.id}.tsx`;
-      const shotAbs = safeJoin(ctx.projectRoot, shotRel);
-      const existed = fs.existsSync(shotAbs) && !fs.readFileSync(shotAbs, 'utf8').includes('SHOT S1 — PLACEHOLDER');
-      const prepared = prepareModularShotFile(ctx.projectRoot, epDir, input.id, input.code);
-      fs.writeFileSync(shotAbs, prepared, 'utf8');
-      const allIds = syncShotsBarrel(epDir);
-      const tscNote = await quickEpisodeTypecheck(ctx.projectRoot, shotRel);
+    } else {
+      const baseShot =
+        input.shot && typeof input.shot === 'object' && !Array.isArray(input.shot)
+          ? { ...(input.shot as Record<string, unknown>) }
+          : { ...input };
+      delete baseShot.episode;
+      delete baseShot.shot;
+      delete baseShot.shots;
+      const eid = String(input.id ?? baseShot.id ?? '').trim().toUpperCase();
+      baseShot.id = eid;
+      candidates.push({ expectedId: eid, raw: baseShot });
+    }
+
+    assertNotCompactedPlaceholder(JSON.stringify(candidates), 'edit_shot');
+
+    const validated: DiffusionShotSpec[] = [];
+    const errors: string[] = [];
+    for (const c of candidates) {
+      const res = validateShotSpec(c.raw, c.expectedId);
+      if (!res.shot || res.errors.length) {
+        errors.push(...res.errors);
+        continue;
+      }
+      errors.push(...checkShotAgainstBible(epDir, res.shot));
+      validated.push(res.shot);
+    }
+
+    if (errors.length) {
       return {
-        ok: true,
-        summary: `${existed ? 'replaced' : 'added'} ${input.id} in ${shotRel} (${allIds.length} shot(s) synced in shots.tsx)${tscNote}`,
-        data: { path: shotRel, id: input.id, replaced: existed, modular: true },
+        ok: false,
+        summary: `edit_shot rejected:\n- ${errors.slice(0, 15).join('\n- ')}`,
       };
     }
 
-    // Legacy monolithic fallback: AST-safe single-shot replacement inside `shots.tsx`
-    const rel = `${epRel}/shots.tsx`;
-    const abs = safeJoin(ctx.projectRoot, rel);
-    const { text, replaced } = replaceShot(fs.readFileSync(abs, 'utf8'), input.id, input.code);
-    fs.writeFileSync(abs, normalizeEpisodeTsx(ctx.projectRoot, rel, text), 'utf8');
-    const tscNote = await quickEpisodeTypecheck(ctx.projectRoot, rel);
-    return { ok: true, summary: `${replaced ? 'replaced' : 'added'} ${input.id} in ${rel}${tscNote}`, data: { path: rel, id: input.id, replaced } };
+    const shotsDir = path.join(epDir, 'shots');
+    fs.mkdirSync(shotsDir, { recursive: true });
+    // Remove scaffold S1 placeholder if another shot is written first
+    if (!validated.some((s) => s.id === 'S1')) {
+      const stubS1 = path.join(shotsDir, 'S1.json');
+      if (fs.existsSync(stubS1) && fs.readFileSync(stubS1, 'utf8').includes('PLACEHOLDER')) {
+        fs.unlinkSync(stubS1);
+      }
+    }
+
+    const writtenIds: string[] = [];
+    let replacedCount = 0;
+    for (const spec of validated) {
+      const shotRel = `${epRel}/shots/${spec.id}.json`;
+      const shotAbs = safeJoin(ctx.projectRoot, shotRel);
+      const existed = fs.existsSync(shotAbs) && !fs.readFileSync(shotAbs, 'utf8').includes('PLACEHOLDER');
+      if (existed) replacedCount++;
+      fs.writeFileSync(shotAbs, JSON.stringify(spec, null, 2) + '\n', 'utf8');
+      writtenIds.push(spec.id);
+    }
+
+    const bundle = readEpisodeShots(epDir);
+    return {
+      ok: true,
+      summary: `Saved ${writtenIds.length} shot prompt(s) (${sortShotIds(writtenIds).join(', ')}; ${replacedCount} replaced). Total exported in shots/: ${bundle.exportedShotIds.length}.`,
+      data: {
+        ids: sortShotIds(writtenIds),
+        totalExported: bundle.exportedShotIds.length,
+        replaced: replacedCount,
+      },
+    };
   },
 };
 
-export const fsTools: Tool[] = [repoMap, readFile, writeFile, editFile, editShot, glob, grep, viewImage];
+export const fsTools: Tool[] = [repoMap, readFile, writeFile, editFile, writeBible, editShot, glob, grep, viewImage];

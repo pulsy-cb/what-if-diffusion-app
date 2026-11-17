@@ -1290,12 +1290,12 @@ function kickoffMessage({ episode, video, aspect }) {
   if (!video) return null;
   const fmt = aspect === '9:16' ? '9:16 vertical (1080×1920)' : '16:9 paysage (1920×1080)';
   return [
-    `Nouvel épisode « ${episode} » (format ${fmt}) à partir de la vidéo nouveau ${video}. Fais tout, du début à la fin, sans me demander de validation.`,
-    `1. whatif_run {step:"source", args:["--pick","hook","--apply"]} : récupère la proposition de narration du serveur :8005 (qu'elle soit en français ou en anglais) dans out/${episode}/source.fr.md et l'applique directement dans episode.json.script. IMPORTANT : NE RACCOURCIS PAS, NE TRADUIS PAS et NE RÉÉCRIS PAS la proposition du serveur :8005, et NE BLOQUE JAMAIS si la proposition ou l'audio est en anglais (continue toute la production dans la même langue que la proposition ; règle simplement "defaultSet" selon le lieu de l'histoire et conserve "aspect": "${aspect || '16:9'}").`,
-    `2. Enchaîne voice (si le serveur :8005 a déjà un audio cohérent pour cette vidéo, voice le récupère automatiquement sans en régénérer un nouveau — n'ajoute pas --force), puis shotlist et plan.`,
-    `3. Avant de coder shots.tsx, écris une vraie note de réalisation et mise en scène dans src/episodes/${episode}/DIRECTOR.md : (a) Le décor du lieu de l'histoire en 3 couches de profondeur (arrière-plan, mobilier du plan moyen, premier plan) : pars d'un lieu du catalogue quand il correspond (place(), que tu adaptes à l'histoire), sinon compose-le pièce par pièce ; une table ou un bureau seulement si l'histoire en a besoin. (b) Casting et costumes (cast()). (c) Découpage plan par plan : varie les tailles et les angles, personnages de trois-quarts, de profil ou de dos (yaw), champs/contrechamps face à face, amorces floues, groupes étagés en profondeur ; chorégraphie précise des mains/bras quand un personnage prend, tient ou pose un objet (aucun accessoire ne doit flotter loin des mains).`,
-    `4. Écris shots.tsx et index.tsx en suivant fidèlement DIRECTOR.md, lance stills et board, regarde les planches de contact (out/${episode}/sheets/) avec view_image, passe la checklist du guide du réalisateur plan par plan et corrige seulement les plans qui échouent.`,
-    `5. Puis sfx, render et master jusqu'au mp4 final en ${fmt}, et résume-moi le résultat (durée, orientation, LUFS, fichiers).`,
+    `Nouvel épisode « ${episode} » (format ${fmt}) à partir de la vidéo nouveau ${video}. Fais tout, du début à la fin, en mode 100 % Diffusion (Nano Banana 2 Lite + Gemini Omni Flash 2.1), sans carton-titre ni musique.`,
+    `1. whatif_run {step:"source", args:["--pick","hook","--apply"]} : récupère la proposition de narration du serveur :8005 (FR ou EN) dans out/${episode}/source.fr.md et l'applique intégralement dans episode.json.script. IMPORTANT : NE RACCOURCIS PAS, NE TRADUIS PAS et NE RÉÉCRIS PAS le texte de :8005 ; règle simplement "defaultSet" et conserve "aspect": "${aspect || '16:9'}".`,
+    `2. Enchaîne voice (réutilise l'audio :8005 s'il correspond au genre du narrateur, sinon ElevenLabs v4 Léa/Hugo), puis shotlist (aucun plan titre) et plan.`,
+    `3. Écris la note de réalisation src/episodes/${episode}/DIRECTOR.md (style 2D, palette, personnages, découpage varié sans titre), valide toutes les fiches avec stage_shots, puis crée la Bible visuelle via write_bible (stylePrompt invariant, lieux, personnages) et génère les planches de référence neutres via whatif_run {step:"refs"}.`,
+    `4. Rédige les fiches de prompts de chaque plan (shots/S1.json .. SN.json) avec edit_shot (imagePrompt pour Nano Banana 2 Lite avec uniquement les personnages du plan, onScreenText diégétique uniquement dans la langue du script — jamais de titre d'épisode —, videoPrompt I2V + sfxHint pour Gemini Omni Flash 2.1 strictement SANS musique et SANS dialogue).`,
+    `5. Lance stills et board, inspecte les planches (out/${episode}/sheets/) avec view_image, laisse le Reviewer indépendant valider le storyboard (et corrige uniquement les plans refusés si besoin), puis lance render (clips Omni Flash 2.1 + montage FFmpeg calé au frame près avec voix :8005 + SFX natifs + master -14 LUFS) et résume-moi le résultat.`,
   ].join('\n');
 }
 
@@ -1590,6 +1590,19 @@ function renderCatalogStatusBanner(s) {
   }
 }
 
+function populateMediaSelect(selectEl, presets, selectedId) {
+  if (!selectEl) return;
+  selectEl.replaceChildren();
+  const entries = Object.entries(presets || {});
+  for (const [id, info] of entries) {
+    selectEl.append(el('option', { value: id, text: info.label || id }));
+  }
+  if (selectedId && !entries.some(([id]) => id === selectedId)) {
+    selectEl.append(el('option', { value: selectedId, text: selectedId }));
+  }
+  if (selectedId) selectEl.value = selectedId;
+}
+
 async function openSettings() {
   const s = await api('/api/settings');
   S.settings = s;
@@ -1623,6 +1636,39 @@ async function openSettings() {
   syncSettingsApiKeyVisibility();
   renderCatalogStatusBanner(s);
 
+  const mediaPresets = s.media?.presets || {};
+  const imgCfg = s.media?.image || {};
+  const vidCfg = s.media?.video || {};
+  const upCfg = s.media?.upscaler || {};
+  populateMediaSelect($('#s-img-provider'), mediaPresets, imgCfg.provider || imgCfg.driver || 'gflow');
+  populateMediaSelect($('#s-vid-provider'), mediaPresets, vidCfg.provider || vidCfg.driver || 'gflow');
+  if ($('#s-img-model')) $('#s-img-model').value = imgCfg.model || 'nano2-lite';
+  if ($('#s-img-baseurl')) $('#s-img-baseurl').value = imgCfg.baseURL || '';
+  if ($('#s-img-refmode')) $('#s-img-refmode').value = imgCfg.refMode || 'multi';
+  if ($('#s-img-key')) {
+    $('#s-img-key').value = '';
+    $('#s-img-key').placeholder = imgCfg.hasKey ? '(clé enregistrée / locale)' : 'clé API image…';
+  }
+  if ($('#s-vid-model')) $('#s-vid-model').value = vidCfg.model || 'omni-1.2-flash';
+  if ($('#s-vid-resolution')) $('#s-vid-resolution').value = vidCfg.resolution || '360p';
+  if ($('#s-vid-baseurl')) $('#s-vid-baseurl').value = vidCfg.baseURL || '';
+  if ($('#s-vid-endpoint')) $('#s-vid-endpoint').value = vidCfg.endpointPath || '';
+  if ($('#s-vid-key')) {
+    $('#s-vid-key').value = '';
+    $('#s-vid-key').placeholder = vidCfg.hasKey ? '(clé enregistrée / locale)' : 'clé API vidéo…';
+  }
+  if ($('#s-up-enabled')) $('#s-up-enabled').value = upCfg.enabled ? 'true' : 'false';
+  if ($('#s-up-target')) $('#s-up-target').value = upCfg.target || 'auto-2k';
+  if ($('#s-up-model')) $('#s-up-model').value = upCfg.model || 'real-cugan';
+  if ($('#s-up-denoise')) $('#s-up-denoise').value = String(upCfg.denoiseLevel ?? 1);
+  if ($('#s-up-gpu')) $('#s-up-gpu').value = upCfg.gpuType || 'L40S';
+  if ($('#s-up-baseurl')) $('#s-up-baseurl').value = upCfg.baseURL || 'https://bkrpulsy--anime-upscaler-t4-fastapi-app.modal.run';
+  if ($('#s-media-status')) {
+    const upNote = upCfg.enabled ? ` · Upscale=${upCfg.model}->${upCfg.target}` : ' · Upscale=off';
+    const fbNote = imgCfg.fallbackModel ? ` (fallback ${imgCfg.fallbackModel})` : '';
+    $('#s-media-status').textContent = `Diffusion active : Image=${imgCfg.driver || 'gflow'}:${imgCfg.model || 'nano2-lite'}${fbNote} · Vidéo=${vidCfg.driver || 'gflow'}:${vidCfg.model || 'omni-1.2-flash'}@${vidCfg.resolution || '360p'}${upNote}`;
+  }
+
   const envStatus = $('#s-env-status');
   if (envStatus) {
     if (s.envProvider?.available) {
@@ -1646,7 +1692,6 @@ async function openSettings() {
       ? '✓ Google Antigravity (agy) détecté — modèles récupérés directement via « agy models ».'
       : 'Binaire agy non détecté dans le conteneur : vérifie ~/.local/bin/agy.';
   }
-  $('#s-skill').textContent = `skill : ${s.skillDir || 'introuvable (WHATIF_SKILL_DIR)'}`;
   $('#settings').showModal();
 
   await Promise.all([
@@ -1654,6 +1699,26 @@ async function openSettings() {
     syncModelControl(revProv, 'reviewer', $('#s-rev-model-select'), $('#s-rev-model'), s.reviewer?.model || ''),
   ]);
 }
+
+$('#s-img-provider')?.addEventListener('change', () => {
+  const id = $('#s-img-provider').value;
+  const preset = S.settings?.media?.presets?.[id];
+  if (preset) {
+    if ($('#s-img-baseurl')) $('#s-img-baseurl').value = preset.baseURL || '';
+    if ($('#s-img-model') && preset.imageModel) $('#s-img-model').value = preset.imageModel;
+    if ($('#s-img-refmode') && preset.refMode) $('#s-img-refmode').value = preset.refMode;
+  }
+});
+
+$('#s-vid-provider')?.addEventListener('change', () => {
+  const id = $('#s-vid-provider').value;
+  const preset = S.settings?.media?.presets?.[id];
+  if (preset) {
+    if ($('#s-vid-baseurl')) $('#s-vid-baseurl').value = preset.baseURL || '';
+    if ($('#s-vid-model') && preset.videoModel) $('#s-vid-model').value = preset.videoModel;
+    if ($('#s-vid-resolution') && preset.defaultResolution) $('#s-vid-resolution').value = preset.defaultResolution;
+  }
+});
 
 $('#s-provider').addEventListener('change', () => {
   const key = $('#s-provider').value;
@@ -1729,6 +1794,23 @@ $('#s-save').addEventListener('click', async (e) => {
       reviewBaseURL: revProv === prov ? $('#s-baseurl').value : revPreset?.baseURL || '',
       reviewModel: revModel,
       apiKey: $('#s-key').value,
+      imageProvider: $('#s-img-provider')?.value || '',
+      imageBaseURL: $('#s-img-baseurl')?.value || '',
+      imageModel: $('#s-img-model')?.value || '',
+      imageRefMode: $('#s-img-refmode')?.value || 'composite',
+      imageApiKey: $('#s-img-key')?.value || '',
+      videoProvider: $('#s-vid-provider')?.value || '',
+      videoBaseURL: $('#s-vid-baseurl')?.value || '',
+      videoModel: $('#s-vid-model')?.value || '',
+      videoResolution: $('#s-vid-resolution')?.value || '1080p',
+      videoEndpointPath: $('#s-vid-endpoint')?.value || '',
+      videoApiKey: $('#s-vid-key')?.value || '',
+      upscalerEnabled: $('#s-up-enabled')?.value || 'false',
+      upscalerTarget: $('#s-up-target')?.value || 'auto-2k',
+      upscalerModel: $('#s-up-model')?.value || 'real-cugan',
+      upscalerDenoise: $('#s-up-denoise')?.value || '1',
+      upscalerGpu: $('#s-up-gpu')?.value || 'L40S',
+      upscalerBaseURL: $('#s-up-baseurl')?.value || '',
     }),
   });
   $('#settings').close();
@@ -1849,7 +1931,6 @@ $('#pm-save')?.addEventListener('click', async (e) => {
     S.settings = s;
     S.presets = s.presets || S.presets;
     $('#model').textContent = formatModelSummary(s);
-    if (!s.skillDir) $('#model').title = 'WHATIF_SKILL_DIR introuvable : le scaffold et les scripts ne marcheront pas';
     await loadProjects();
     if (S.projects.length) {
       const savedId = localStorage.getItem('whatif.lastProject');

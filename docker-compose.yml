@@ -1,17 +1,14 @@
 services:
   studio:
     build: .
-    image: what-if-app
+    image: what-if-diffusion-app
     init: true
-    # Host networking: the local TTS/translation API (nouveau, :8005) listens on the host's 127.0.0.1,
-    # so a bridge network cannot reach it. The app therefore binds 127.0.0.1 itself (never 0.0.0.0).
-    # If you prefer a bridge, run uvicorn on 0.0.0.0:8005 and use extra_hosts + WHATIF_NOUVEAU_URL.
+    # Host networking: the local TTS/translation API (nouveau, :8005) and local media proxies listen on 127.0.0.1.
     network_mode: host
     environment:
-      WHATIF_SKILL_DIR: /skill
       WHATIF_DATA: /data
-      WHATIF_HOST: 127.0.0.1
-      WHATIF_PORT: 3000
+      WHATIF_HOST: ${WHATIF_HOST:-127.0.0.1}
+      WHATIF_PORT: ${WHATIF_PORT:-3020}
       WHATIF_ALLOWED_ORIGINS: ${WHATIF_ALLOWED_ORIGINS:-}
       WHATIF_AUTH_TOKEN: ${WHATIF_AUTH_TOKEN:-}
       WHATIF_PROVIDER: ${WHATIF_PROVIDER:-mock}
@@ -24,31 +21,46 @@ services:
       WHATIF_APPROVALS: ${WHATIF_APPROVALS:-off}
       WHATIF_MAX_STEPS: ${WHATIF_MAX_STEPS:-1000}
       WHATIF_MAX_TOKENS: ${WHATIF_MAX_TOKENS:-24000}
+      # Diffusion Image (Nano Banana 2 Lite / 2.1) & Vidéo I2V (Omni 1.2 Flash 360p) via gflow :8006
+      WHATIF_IMAGE_PROVIDER: ${WHATIF_IMAGE_PROVIDER:-gflow}
+      WHATIF_IMAGE_BASE_URL: ${WHATIF_IMAGE_BASE_URL:-http://127.0.0.1:8006}
+      WHATIF_IMAGE_API_KEY: ${WHATIF_IMAGE_API_KEY:-}
+      WHATIF_IMAGE_MODEL: ${WHATIF_IMAGE_MODEL:-nano2-lite}
+      WHATIF_IMAGE_FALLBACK_MODEL: ${WHATIF_IMAGE_FALLBACK_MODEL:-nano2.1}
+      WHATIF_IMAGE_REF_MODE: ${WHATIF_IMAGE_REF_MODE:-multi}
+      WHATIF_IMAGE_MAX_REFS: ${WHATIF_IMAGE_MAX_REFS:-10}
+      WHATIF_GFLOW_PROFILE: ${WHATIF_GFLOW_PROFILE:-}
+      WHATIF_VIDEO_PROVIDER: ${WHATIF_VIDEO_PROVIDER:-gflow}
+      WHATIF_VIDEO_BASE_URL: ${WHATIF_VIDEO_BASE_URL:-http://127.0.0.1:8006}
+      WHATIF_VIDEO_API_KEY: ${WHATIF_VIDEO_API_KEY:-}
+      WHATIF_VIDEO_MODEL: ${WHATIF_VIDEO_MODEL:-omni-1.2-flash}
+      WHATIF_VIDEO_RESOLUTION: ${WHATIF_VIDEO_RESOLUTION:-360p}
+      # Upscaler Anime 2D optionnel (Real-CUGAN / Real-ESRGAN sur Modal GPU)
+      WHATIF_UPSCALER_ENABLED: ${WHATIF_UPSCALER_ENABLED:-false}
+      WHATIF_UPSCALER_DRIVER: ${WHATIF_UPSCALER_DRIVER:-modal-anime}
+      WHATIF_UPSCALER_URL: ${WHATIF_UPSCALER_URL:-https://bkrpulsy--anime-upscaler-t4-fastapi-app.modal.run}
+      WHATIF_UPSCALER_API_KEY: ${WHATIF_UPSCALER_API_KEY:-}
+      WHATIF_UPSCALER_TARGET: ${WHATIF_UPSCALER_TARGET:-auto-2k}
+      WHATIF_UPSCALER_MODEL: ${WHATIF_UPSCALER_MODEL:-real-cugan}
+      WHATIF_UPSCALER_DENOISE: ${WHATIF_UPSCALER_DENOISE:-1}
+      WHATIF_UPSCALER_GPU: ${WHATIF_UPSCALER_GPU:-L40S}
       # the independent reviewer: a vision model is advised (see .env.example)
       WHATIF_REVIEWER_ENABLED: ${WHATIF_REVIEWER_ENABLED:-}
       WHATIF_REVIEW_PROVIDER: ${WHATIF_REVIEW_PROVIDER:-}
       WHATIF_REVIEW_BASE_URL: ${WHATIF_REVIEW_BASE_URL:-}
       WHATIF_REVIEW_MODEL: ${WHATIF_REVIEW_MODEL:-}
       WHATIF_REVIEW_API_KEY: ${WHATIF_REVIEW_API_KEY:-}
-      WHATIF_REVIEW_MAX_ROUNDS: ${WHATIF_REVIEW_MAX_ROUNDS:-2}
+      WHATIF_REVIEW_MAX_ROUNDS: ${WHATIF_REVIEW_MAX_ROUNDS:-3}
       WHATIF_REVIEW_MAX_TOKENS: ${WHATIF_REVIEW_MAX_TOKENS:-12000}
-      # the local app that owns the videos, the French narrations and the TTS takes
+      # the local app that owns the videos, the narrations and the TTS takes
       WHATIF_NOUVEAU_URL: ${WHATIF_NOUVEAU_URL:-http://127.0.0.1:8005}
       WHATIF_NARRATION_MODEL: ${WHATIF_NARRATION_MODEL:-deepseek/deepseek-v4-flash-0731}
-      # renders: "modal" (default) or "local" (needs npm install in the project + a browser)
-      WHATIF_RENDER: ${WHATIF_RENDER:-modal}
-      MODAL_TOKEN_ID: ${MODAL_TOKEN_ID:-}
-      MODAL_TOKEN_SECRET: ${MODAL_TOKEN_SECRET:-}
-      WHATIF_MODAL_APP: ${WHATIF_MODAL_APP:-whatif-app-render}
-      # ElevenLabs is only used by the SFX step now
-      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
       # Persist Google Antigravity (agy) OAuth token on disk (/data/.gemini) instead of desktop keyring
       GEMINI_FORCE_FILE_STORAGE: "true"
     volumes:
       - ./data:/data                                   # projects, sqlite, git checkpoints (+ data/providers.json)
-      - ./providers.json:/app/providers.json:ro        # multi-provider & multi-model catalog (hot-reloaded)
-      - ../what-if-animation:/skill:ro                 # the skill: engine, scripts, references
-      - ${HOME}/.modal.toml:/home/node/.modal.toml:ro  # Modal credentials, if not passed as env
+      # décommenter après `cp providers.example.json providers.json`, ou placer directement data/providers.json déjà monté via ./data:/data
+      # - ./providers.json:/app/providers.json:ro
       - ${HOME}/.codex:/home/node/.codex               # ChatGPT / Codex OAuth session (auth.json)
       - ${HOME}/.local/bin/agy:/usr/local/bin/agy:ro   # Google Antigravity CLI binary
     shm_size: "1gb"

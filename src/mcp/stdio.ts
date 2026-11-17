@@ -3,11 +3,11 @@
  * Stdio MCP Server for What If Studio (`whatif-studio`).
  *
  * Bridges Antigravity (`agy`) CLI — and its Independent Reviewer subagents — directly to the
- * running Studio container (`http://127.0.0.1:3000`), giving native host `agy` sessions:
- *   - 100% of the Studio's tools, TypeScript/SSR/layout audits, `:8005` TTS/ASR, and Modal cloud rendering,
+ * running Studio container (`http://127.0.0.1:3020`), giving native host `agy` sessions:
+ *   - 100% of the Studio's tools, diffusion Bible/prompt/layout audits, `:8005` TTS/ASR, Nano Banana 2 Lite + Gemini Omni Flash 2.1 generation, and FFmpeg/-14 LUFS mastering,
  *   - zero cold `agy -p` subprocess overhead,
  *   - automatic translation of container `/data/projects/...` paths into real host paths so `agy` and its
- *     Reviewer subagent can `read_file` contact sheets (`sheet-*.jpg`) and high-res stills (`S*.png`) directly.
+ *     Reviewer subagent can `read_file` reference sheets (`refs/*.png`), contact sheets (`sheet-*.jpg`), and high-res stills (`S*.png`) directly.
  */
 import fs from 'node:fs';
 import http from 'node:http';
@@ -43,7 +43,7 @@ function readDotEnv(file: string): Record<string, string> {
 }
 
 const dotEnv = readDotEnv(path.join(APP_ROOT, '.env'));
-const STUDIO_PORT = Number(process.env.WHATIF_PORT || dotEnv.WHATIF_PORT || 3000);
+const STUDIO_PORT = Number(process.env.WHATIF_PORT || dotEnv.WHATIF_PORT || 3020);
 const STUDIO_HOST = process.env.WHATIF_STUDIO_HOST || '127.0.0.1';
 const AUTH_TOKEN = process.env.WHATIF_AUTH_TOKEN || dotEnv.WHATIF_AUTH_TOKEN || '';
 

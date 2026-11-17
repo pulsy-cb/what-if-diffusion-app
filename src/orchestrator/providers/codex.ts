@@ -291,76 +291,118 @@ export function codexProvider(cfg: {
           signal: req.signal,
         });
 
-      let res = await doFetch(auth.accessToken, auth.accountId);
-      if (res.status === 401 && auth.refreshToken) {
-        auth = await refreshCodexAuth(auth, cfg.oauthTokenUrl);
-        res = await doFetch(auth.accessToken, auth.accountId);
-      }
+      const isTransientStreamErr = (err: unknown): boolean => {
+        if (req.signal?.aborted) return false;
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/\b(400|401|403|404|invalid_request|context_length)\b/i.test(msg)) return false;
+        return /\b(terminated|idle timeout|socket|ECONNRESET|EAI_AGAIN|fetch failed|UND_ERR|Premature close|network)\b/i.test(msg);
+      };
 
-      if (!res.ok) {
-        const errBody = await res.text().catch(() => '');
-        throw new Error(`${res.status} ${res.statusText} from ${base}/responses (${converted.model})\n${errBody.slice(0, 1200)}`);
-      }
+      const maxStreamAttempts = 3;
+      let emittedTextLen = 0;
 
-      let text = '';
-      let finishReason: string | undefined;
-      let usage: unknown;
-      let truncatedToolCall: string | undefined;
-      const toolCalls: ToolCall[] = [];
-      const seenCallIds = new Set<string>();
+      for (let attempt = 1; attempt <= maxStreamAttempts; attempt++) {
+        try {
+          if (attempt > 1) auth = await loadValidCodexAuth(authPath, cfg.oauthTokenUrl);
+          let res = await doFetch(auth.accessToken, auth.accountId);
+          if (res.status === 401 && auth.refreshToken) {
+            auth = await refreshCodexAuth(auth, cfg.oauthTokenUrl);
+            res = await doFetch(auth.accessToken, auth.accountId);
+          }
 
-      for await (const data of sseData(res.body)) {
-        if (data === '[DONE]') break;
-        const evt = safeJson(data);
-        if (!evt || typeof evt !== 'object') continue;
+          if (!res.ok) {
+            const errBody = await res.text().catch(() => '');
+            throw new Error(`${res.status} ${res.statusText} from ${base}/responses (${converted.model})\n${errBody.slice(0, 1200)}`);
+          }
 
-        if (evt.type === 'error' || evt.type === 'response.failed') {
-          const msg = evt.error?.message || evt.response?.error?.message || JSON.stringify(evt.error ?? evt);
-          throw new Error(`Codex stream error (${converted.model}): ${msg}`);
-        }
+          let text = '';
+          let finishReason: string | undefined;
+          let usage: unknown;
+          let truncatedToolCall: string | undefined;
+          const toolCalls: ToolCall[] = [];
+          const seenCallIds = new Set<string>();
 
-        if (evt.type === 'response.output_text.delta' && typeof evt.delta === 'string' && evt.delta) {
-          text += evt.delta;
-          req.onText?.(evt.delta);
-          continue;
-        }
+          const emitDelta = (delta: string) => {
+            const prevLen = text.length;
+            text += delta;
+            if (text.length > emittedTextLen) {
+              const sliceStart = Math.max(0, emittedTextLen - prevLen);
+              const fresh = delta.slice(sliceStart);
+              if (fresh) req.onText?.(fresh);
+              emittedTextLen = text.length;
+            }
+          };
 
-        if (evt.type === 'response.output_item.done' && evt.item) {
-          const item = evt.item;
-          if (item.type === 'function_call' && item.name) {
-            const callId = String(item.call_id || item.id || `call_${toolCalls.length}_${Date.now()}`);
-            if (seenCallIds.has(callId)) continue;
-            seenCallIds.add(callId);
-            const rawArgs = typeof item.arguments === 'string' ? item.arguments.trim() : '';
-            const parsed = rawArgs ? safeJson(rawArgs) : {};
-            if (parsed === null || typeof parsed !== 'object') {
-              truncatedToolCall = String(item.name);
+          for await (const data of sseData(res.body, { idleTimeoutMs: 180_000, signal: req.signal })) {
+            if (data === '[DONE]') break;
+            const evt = safeJson(data);
+            if (!evt || typeof evt !== 'object') continue;
+
+            if (evt.type === 'error' || evt.type === 'response.failed') {
+              const msg = evt.error?.message || evt.response?.error?.message || JSON.stringify(evt.error ?? evt);
+              throw new Error(`Codex stream error (${converted.model}): ${msg}`);
+            }
+
+            if (evt.type === 'response.output_text.delta' && typeof evt.delta === 'string' && evt.delta) {
+              emitDelta(evt.delta);
               continue;
             }
-            toolCalls.push({
-              id: callId,
-              name: String(item.name),
-              args: parsed as Record<string, unknown>,
-            });
-          } else if (item.type === 'message' && !text && Array.isArray(item.content)) {
-            for (const part of item.content) {
-              if (part?.type === 'output_text' && typeof part.text === 'string' && part.text) {
-                text += part.text;
-                req.onText?.(part.text);
+
+            if (evt.type === 'response.output_item.done' && evt.item) {
+              const item = evt.item;
+              if (item.type === 'function_call' && item.name) {
+                const callId = String(item.call_id || item.id || `call_${toolCalls.length}_${Date.now()}`);
+                if (seenCallIds.has(callId)) continue;
+                seenCallIds.add(callId);
+                const rawArgs = typeof item.arguments === 'string' ? item.arguments.trim() : '';
+                const parsed = rawArgs ? safeJson(rawArgs) : {};
+                if (parsed === null || typeof parsed !== 'object') {
+                  truncatedToolCall = String(item.name);
+                  continue;
+                }
+                toolCalls.push({
+                  id: callId,
+                  name: String(item.name),
+                  args: parsed as Record<string, unknown>,
+                });
+              } else if (item.type === 'message' && !text && Array.isArray(item.content)) {
+                for (const part of item.content) {
+                  if (part?.type === 'output_text' && typeof part.text === 'string' && part.text) {
+                    emitDelta(part.text);
+                  }
+                }
               }
+              continue;
+            }
+
+            if (evt.type === 'response.completed' || evt.type === 'response.incomplete') {
+              const status = evt.response?.status ?? (evt.type === 'response.incomplete' ? 'incomplete' : 'completed');
+              finishReason = status === 'incomplete' ? 'length' : toolCalls.length > 0 ? 'tool_calls' : 'stop';
+              usage = evt.response?.usage;
             }
           }
-          continue;
-        }
 
-        if (evt.type === 'response.completed' || evt.type === 'response.incomplete') {
-          const status = evt.response?.status ?? (evt.type === 'response.incomplete' ? 'incomplete' : 'completed');
-          finishReason = status === 'incomplete' ? 'length' : toolCalls.length > 0 ? 'tool_calls' : 'stop';
-          usage = evt.response?.usage;
+          return { text, toolCalls, usage, finishReason, truncatedToolCall };
+        } catch (err) {
+          if (attempt >= maxStreamAttempts || !isTransientStreamErr(err)) throw err;
+          const waitMs = 4_000 * attempt;
+          console.error(`[codex] ${err instanceof Error ? err.message : String(err)} — stream retry ${attempt}/${maxStreamAttempts - 1} in ${waitMs / 1000}s`);
+          await new Promise<void>((resolve, reject) => {
+            if (req.signal?.aborted) return reject(new Error('aborted'));
+            const t = setTimeout(() => {
+              req.signal?.removeEventListener('abort', onAbort);
+              resolve();
+            }, waitMs);
+            const onAbort = () => {
+              clearTimeout(t);
+              reject(new Error('aborted'));
+            };
+            req.signal?.addEventListener('abort', onAbort, { once: true });
+          });
         }
       }
 
-      return { text, toolCalls, usage, finishReason, truncatedToolCall };
+      throw new Error(`codex (${normalizedModel}) exhausted retries`);
     },
   };
 }

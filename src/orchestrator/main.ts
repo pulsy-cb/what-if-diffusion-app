@@ -24,6 +24,7 @@ import {
 } from './providers/index.js';
 import { runTurn } from './agent.js';
 import { callMcpTool, listMcpTools } from '../mcp/service.js';
+import { getMediaPresets, mediaEnvForSubprocess, resolveMediaConfig } from './media-providers.js';
 import { mimeOf, safeJoin, walk } from '../tools/paths.js';
 
 function safeTokenEqual(a: string, b: string): boolean {
@@ -131,6 +132,7 @@ export function createApp(config: Config = loadConfig()): App {
       projectRoot: project.root,
       dataRoot: config.dataRoot,
       skillDir: config.skillDir,
+      mediaEnv: mediaEnvForSubprocess(db, process.env, config.dataRoot),
       log: (line) => bus.emit(threadId, 'log', { line }),
       signal,
     };
@@ -197,7 +199,7 @@ export function createApp(config: Config = loadConfig()): App {
   async function api(method: string, pathname: string, url: URL, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const parts = pathname.split('/').filter(Boolean); // ['api', ...]
 
-    if (parts[1] === 'health') return json(res, 200, { ok: true, skillDir: config.skillDir, node: process.version });
+    if (parts[1] === 'health') return json(res, 200, { ok: true, mode: 'diffusion', skillDir: config.skillDir, node: process.version });
 
     // ---- settings
     if (parts[1] === 'settings') {
@@ -208,6 +210,8 @@ export function createApp(config: Config = loadConfig()): App {
         const agyReady = hasAgyCli();
         const envProvider = getEnvProviderSummary();
         const providersCatalog = getProvidersCatalogSummary(process.env, config.dataRoot);
+        const mediaCfg = resolveMediaConfig(db, process.env, config.dataRoot);
+        const mediaPresets = getMediaPresets(process.env, config.dataRoot);
         return json(res, 200, {
           provider: cfg.provider,
           baseURL: cfg.baseURL,
@@ -226,18 +230,85 @@ export function createApp(config: Config = loadConfig()): App {
           providersCatalog,
           reviewer: revCfg ? { provider: revCfg.provider, model: revCfg.model, baseURL: revCfg.baseURL } : null,
           presets: getProviderPresets(process.env, config.dataRoot),
+          media: {
+            image: {
+              provider: mediaCfg.image.id,
+              driver: mediaCfg.image.driver,
+              baseURL: mediaCfg.image.baseURL,
+              model: mediaCfg.image.model,
+              fallbackModel: mediaCfg.image.fallbackModel || '',
+              refMode: mediaCfg.image.refMode,
+              maxRefs: mediaCfg.image.maxRefs,
+              hasKey: mediaCfg.image.hasKey,
+            },
+            video: {
+              provider: mediaCfg.video.id,
+              driver: mediaCfg.video.driver,
+              baseURL: mediaCfg.video.baseURL,
+              model: mediaCfg.video.model,
+              resolution: mediaCfg.video.resolution || (mediaCfg.video.driver === 'gflow' ? '360p' : '1080p'),
+              endpointPath: mediaCfg.video.endpointPath || '',
+              hasKey: mediaCfg.video.hasKey,
+            },
+            upscaler: {
+              enabled: mediaCfg.upscaler.enabled,
+              driver: mediaCfg.upscaler.driver,
+              baseURL: mediaCfg.upscaler.baseURL,
+              hasKey: mediaCfg.upscaler.hasKey,
+              target: mediaCfg.upscaler.target,
+              model: mediaCfg.upscaler.model,
+              denoiseLevel: mediaCfg.upscaler.denoiseLevel,
+              gpuType: mediaCfg.upscaler.gpuType,
+            },
+            presets: mediaPresets,
+          },
           skillDir: config.skillDir,
           maxSteps: config.maxSteps,
         });
       }
       if (method === 'POST') {
         const body = await readJson(req);
-        for (const key of ['provider', 'baseURL', 'model', 'reviewProvider', 'reviewBaseURL', 'reviewModel', 'reviewerEnabled'] as const) {
+        for (const key of [
+          'provider',
+          'baseURL',
+          'model',
+          'reviewProvider',
+          'reviewBaseURL',
+          'reviewModel',
+          'reviewerEnabled',
+          'imageProvider',
+          'imageBaseURL',
+          'imageModel',
+          'imageFallbackModel',
+          'imageRefMode',
+          'gflowProfile',
+          'videoProvider',
+          'videoBaseURL',
+          'videoModel',
+          'videoResolution',
+          'videoEndpointPath',
+          'upscalerEnabled',
+          'upscalerDriver',
+          'upscalerBaseURL',
+          'upscalerTarget',
+          'upscalerModel',
+          'upscalerDenoise',
+          'upscalerGpu',
+        ] as const) {
           if (typeof body[key] === 'string') db.setSetting(key, body[key].trim());
+          else if ((key === 'upscalerEnabled' || key === 'upscalerDenoise') && (typeof body[key] === 'boolean' || typeof body[key] === 'number')) {
+            db.setSetting(key, String(body[key]));
+          }
         }
         if (typeof body.apiKey === 'string' && body.apiKey.trim()) db.setSetting('apiKey', body.apiKey.trim());
         if (body.clearKey === true) db.setSetting('apiKey', '');
         if (typeof body.reviewApiKey === 'string' && body.reviewApiKey.trim()) db.setSetting('reviewApiKey', body.reviewApiKey.trim());
+        if (typeof body.imageApiKey === 'string' && body.imageApiKey.trim()) db.setSetting('imageApiKey', body.imageApiKey.trim());
+        if (body.clearImageKey === true) db.setSetting('imageApiKey', '');
+        if (typeof body.videoApiKey === 'string' && body.videoApiKey.trim()) db.setSetting('videoApiKey', body.videoApiKey.trim());
+        if (body.clearVideoKey === true) db.setSetting('videoApiKey', '');
+        if (typeof body.upscalerApiKey === 'string' && body.upscalerApiKey.trim()) db.setSetting('upscalerApiKey', body.upscalerApiKey.trim());
+        if (body.clearUpscalerKey === true) db.setSetting('upscalerApiKey', '');
         return json(res, 200, { ok: true });
       }
     }
@@ -374,7 +445,7 @@ export function createApp(config: Config = loadConfig()): App {
               ...(body.video ? { video: String(body.video) } : {}),
               ...(body.aspect ? { aspect: String(body.aspect) } : {}),
             },
-            { projectId: id, projectRoot: root, dataRoot: config.dataRoot, skillDir: config.skillDir, log: () => {} },
+            { projectId: id, projectRoot: root, dataRoot: config.dataRoot, skillDir: config.skillDir, mediaEnv: mediaEnvForSubprocess(db, process.env, config.dataRoot), log: () => {} },
           );
         } else {
           fs.mkdirSync(root, { recursive: true });
@@ -671,11 +742,14 @@ export async function main(): Promise<void> {
   const config = loadConfig();
   const app = createApp(config);
   await new Promise<void>((resolve) => app.server.listen(config.port, config.host, resolve));
-  const skill = config.skillDir ? config.skillDir : '(not found — set WHATIF_SKILL_DIR)';
+  const mediaCfg = resolveMediaConfig(app.db, process.env, config.dataRoot);
   console.log(`what-if-app  http://${config.host}:${config.port}`);
   console.log(`  data      ${config.dataRoot}`);
-  console.log(`  skill     ${skill}`);
   console.log(`  provider  ${providerConfig(app.db).provider} / ${providerConfig(app.db).model}`);
+  console.log(
+    `  diffusion img=${mediaCfg.image.driver}:${mediaCfg.image.model} | vid=${mediaCfg.video.driver}:${mediaCfg.video.model}@${mediaCfg.video.resolution ?? '1080p'}` +
+      (mediaCfg.upscaler.enabled ? ` | upscale=${mediaCfg.upscaler.model}->${mediaCfg.upscaler.target}` : ''),
+  );
   const shutdown = () => {
     void app.close().then(() => process.exit(0));
   };

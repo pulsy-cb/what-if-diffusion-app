@@ -614,10 +614,7 @@ def infer_shot_size(
     since_insert: int = 99,
 ) -> str:
     """Choose camera framing from the narrative semantics of the clause (never blind % len cycling)."""
-    if is_title:
-        return "title, wide"
-    if room == DIAGRAM:
-        return "schematic"
+    del is_title, room
     if idx == 0:
         return "wide"
 
@@ -695,12 +692,9 @@ def infer_clause_accent(
     elif dramatic_hits >= 2 or (dramatic_hits >= 1 and exclaim):
         look = "tension"
 
+    del is_title, has_non_todo_title
     accent = ""
-    if is_title:
-        accent = "title-card"
-    elif idx == 0 and has_non_todo_title:
-        accent = "hook-title"
-    elif is_time_place:
+    if is_time_place:
         accent = "stamp"
     elif has_amount:
         accent = "tag"
@@ -876,39 +870,7 @@ def main() -> int:
     previous_set = ""
     run = 0
     title_idx = -1
-    has_source_video = bool((ep.get("source") or {}).get("videoId"))
-
-    # Find which chunk best matches the premise / title card (beat 2 or "et si..." phrase in the opening third)
-    best_title_score = 0
-    max_title_pos = max(3, len(bounds) // 3)
-    for i in range(len(bounds)):
-        if i < 1 or i > max_title_pos:
-            continue
-        start = bounds[i]
-        end = bounds[i + 1] if i + 1 < len(bounds) else len(words)
-        chunk = words[start:end]
-        b_label = next((beat_map[idx] for idx in range(start, end) if idx in beat_map), "")
-        chunk_ascii = " ".join(bare_ascii(str(w["w"])) for w in chunk)
-        overlap = len({bare_ascii(str(w["w"])) for w in chunk} & keys)
-        is_whatif_phrase = "et si " in f"{chunk_ascii} " or "what if " in f"{chunk_ascii} "
-        t_score = (
-            (15 if ("2" in b_label or "premise" in b_label.lower() or "title" in b_label.lower()) else 0)
-            + (25 if is_whatif_phrase else 0)
-            + overlap * 3
-        )
-        if t_score > best_title_score:
-            best_title_score = t_score
-            title_idx = i
-    # For standalone 7-beat What If episodes, ensure a title card exists near the start; for narrative :8005 stories,
-    # never force a random title card in the middle of the story unless there is an explicit What If premise!
-    if has_source_video and best_title_score < 18:
-        title_idx = -1
-    elif not has_source_video and title_idx < 0 and len(bounds) >= 4:
-        title_idx = min(3, len(bounds) - 2)
-
-    raw_title = ep.get("title") or []
-    title_str = " ".join(raw_title) if isinstance(raw_title, list) else str(raw_title)
-    has_non_todo_title = bool(title_str.strip()) and "todo" not in title_str.lower() and "… ?" not in title_str
+    has_non_todo_title = False
 
     wi_prev = 0
     prev_size = ""
@@ -935,14 +897,8 @@ def main() -> int:
         b_label = next((beat_map[idx] for idx in range(start, end) if idx in beat_map), "")
         explicit_beat_set = next((beat_sets[idx] for idx in range(start, end) if idx in beat_sets), "")
 
-        is_title = i == title_idx
-        is_turn = has_science and ("4" in b_label or "turn" in b_label.lower() or "cost" in b_label.lower())
-        has_digits = has_science and any(re.search(r"\d", t) for t in text)
-        if is_title:
-            room = explicit_beat_set or (primary_set if primary_set != DIAGRAM else "rooftop")
-        elif is_turn or (has_digits and i > max(0, title_idx) and previous_set != DIAGRAM):
-            room = DIAGRAM
-        elif explicit_beat_set:
+        is_title = False
+        if explicit_beat_set and explicit_beat_set != DIAGRAM:
             room = explicit_beat_set
         else:
             has_explicit_default = bool(str(ep.get("defaultSet") or ep.get("set") or "").strip())
@@ -960,10 +916,11 @@ def main() -> int:
                 hits = {
                     room_name: sum(1 for tok in clause_tokens if tok in {bare_ascii(k) for k in words_of})
                     for room_name, words_of in KEYWORDS.items()
+                    if room_name != DIAGRAM
                 }
                 ranked = sorted(hits.items(), key=lambda kv: -kv[1])
                 best = next(
-                    (name for name, score in ranked if score >= min_hits and (name != DIAGRAM or (has_science and run < 2))),
+                    (name for name, score in ranked if score >= min_hits),
                     "",
                 )
                 if best:
@@ -971,13 +928,13 @@ def main() -> int:
                 elif set(clause_tokens) & MEMORY_LOOK_WORDS and secondary_set != primary_set:
                     # Flashback / memory clause cuts away from the main room so visual memory beats feel distinct
                     room = secondary_set
-                elif previous_set and previous_set != DIAGRAM and (
+                elif previous_set and (
                     (not has_explicit_default and run < 3)
                     or (has_explicit_default and (run < 8 or not (set(clause_tokens) & {"entre", "sorti", "sortie", "porte", "couloir", "dehors", "entered", "left", "door", "hallway", "corridor", "outside"})))
                 ):
                     room = previous_set
                 else:
-                    # Stay faithful to the story's world (primary_set / secondary_set) — never teleport into classroom/kitchen
+                    # Stay faithful to the story's world (primary_set / secondary_set)
                     room = secondary_set if (previous_set == primary_set and run >= 3) else primary_set
         same_room = room == previous_set
         run = run + 1 if same_room else 1
@@ -990,11 +947,9 @@ def main() -> int:
             since_insert = 0
         else:
             since_insert += 1
-        if is_title and not label.lower().startswith("title"):
-            label = f"title card: {label}"
 
         accent_hint, look_name, drama_score = infer_clause_accent(
-            chunk, i, len(bounds), is_title, size, has_non_todo_title and title_idx < 0
+            chunk, i, len(bounds), False, size, False
         )
         if drama_score >= 3 and 1 <= i < len(bounds) - 1:
             drama_candidates.append((drama_score, i))
@@ -1105,7 +1060,7 @@ def main() -> int:
         ]
     )
     ep["fx"] = fx_list
-    ep["sound"] = build_default_sound(shots, title_idx, edit, fx_list)
+    ep["sound"] = {"provider": "omni-flash", "music": False, "dialogue": False}
 
     ep_path.write_text(json.dumps(ep, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
 

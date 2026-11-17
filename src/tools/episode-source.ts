@@ -1,7 +1,5 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import ts from 'typescript';
-import { exportedSymbols } from './paths.js';
 
 /** Sort shot identifiers numerically (`S1`, `S2`, ..., `S10`, `S66`). */
 export function sortShotIds(ids: Iterable<string>): string[] {
@@ -18,279 +16,352 @@ export function extractShotIds(text: string): string[] {
   return sortShotIds((String(text ?? '').match(/\bS\d+\b/gi) ?? []).map((s) => s.toUpperCase()));
 }
 
-/** Built-in engine export names used as a fast fallback when `src/engine` is minimal (e.g. unit tests). */
-const BUILTIN_ENGINE_EXPORTS = new Set([
-  'shot',
-  'Shot',
-  'phoneShot',
-  'tabletopShot',
-  'place',
-  'cast',
-  'definePiece',
-  'ShotProps',
-  'Timeline',
-  'defineEpisode',
-  'EPISODE_LOOKS',
-  'StampCard',
-  'ValueTag',
-  'ShockBurst',
-  'HookTitle',
-  'HeadVfx',
-  'Sparkle',
-  'Tag',
-  'HudChip',
-  'Dial',
-  'Gauge',
-  'FloatLabel',
-  'FocusRings',
-  'DizzyStars',
-  'Marquee',
-  'PasteIn',
-  'Toast',
-  'TapeLines',
-  'Stage',
-  'Staged',
-  'Person',
-  'Duo',
-  'Hero',
-  'Actor',
-  'LOOKS',
-  'makeLook',
-  'basePose',
-  'poseAt',
-  'actPose',
-  'walkPose',
-  'faceAt',
-  'talkAt',
-  'turnAt',
-  'act',
-  'clip',
-  'gesture',
-  'handWorld',
-  'ikArm',
-  'reachPose',
-  'grabAt',
-  'grabOf',
-  'tableSit',
-  'bedSit',
-  'carSit',
-  'Foreground',
-  'makeRoom',
-  'CustomRoom',
-  'RoomShell',
-  'Box',
-  'FloorShadow',
-  'stand',
-  'BackWindow',
-  'Pendant',
-  'WallLight',
-  'FloorPlant',
-  'WallFrame',
-  'WallClock',
-  'WallBoard',
-  'PinBoard',
-  'DiningTable',
-  'MonitorSetup',
-  'Tabletop',
-  'Study',
-  'STUDY',
-  'Desk',
-  'Bedroom',
-  'BEDROOM',
-  'BedDuvet',
-  'Kitchen',
-  'KITCHEN',
-  'islandTop',
-  'Classroom',
-  'CLS',
-  'CLASS_MOODS',
-  'Rooftop',
-  'Stairwell',
-  'Outdoor',
-  'OUTDOOR',
-  'Tree',
-  'StreetLamp',
-  'CarExterior',
-  'Vehicle',
-  'VehicleForeground',
-  'Schematic',
-  'DrawOn',
-  'SchLabel',
-  'CountUp',
-  'Arrow',
-  'TitleCard',
-  'LightVeil',
-  'Glow',
-  'Dust',
-  'camT',
-  'camPush',
-  'camPan',
-  'parallax',
-  'kf',
-  'rnd',
-  'clamp',
-  'easeOut',
-]);
-
-function discoverEngineExports(projectRoot: string): Set<string> {
-  const out = new Set<string>(BUILTIN_ENGINE_EXPORTS);
-  const engineDir = path.join(projectRoot, 'src', 'engine');
-  if (!fs.existsSync(engineDir)) return out;
-  const stack = [engineDir];
-  while (stack.length) {
-    const dir = stack.pop()!;
-    let entries: fs.Dirent[] = [];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const e of entries) {
-      const abs = path.join(dir, e.name);
-      if (e.isDirectory()) {
-        stack.push(abs);
-      } else if (/\.(ts|tsx)$/.test(e.name)) {
-        try {
-          for (const sym of exportedSymbols(fs.readFileSync(abs, 'utf8'))) out.add(sym);
-        } catch {
-          /* ignore */
-        }
-      }
-    }
-  }
-  return out;
-}
-
-function unwrapExpr(e: ts.Expression): ts.Expression {
-  let cur = e;
-  while (ts.isParenthesizedExpression(cur) || ts.isAsExpression(cur) || ts.isSatisfiesExpression(cur)) cur = cur.expression;
-  return cur;
-}
-
-function isExportedStmt(stmt: ts.Statement): boolean {
-  return Boolean(ts.canHaveModifiers(stmt) && ts.getModifiers(stmt)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword));
-}
-
-export type SlicedMonolithic = {
-  header: string;
-  helpersMap: Map<string, string>;
-  ownBodies: Map<string, string>;
-  shotBodies: Record<string, string>;
-  exportedShotIds: string[];
+export type BibleCharacter = {
+  id: string;
+  name: string;
+  role?: string;
+  appearance: string;
+  refPrompt?: string;
 };
 
-/**
- * Parse a monolithic `shots.tsx` (or a single modular `S<N>.tsx` file) via TypeScript AST:
- * - separates top-of-file shared declarations (`header`),
- * - extracts non-exported component/shot helpers (`helpersMap`),
- * - attaches each helper ONLY to the exported `S<N>` shot(s) that reference it (`shotBodies`),
- *   preventing `S11`'s `BEFORE_PULL` helper from bleeding into `S10`!
- */
-export function sliceMonolithicShots(shotsSource: string): SlicedMonolithic {
-  const sf = ts.createSourceFile('shots.tsx', shotsSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-  const ownBodies = new Map<string, string>();
-  const helpersMap = new Map<string, string>();
-  const headerChunks: string[] = [];
-  const exportedShotIds: string[] = [];
+export type BiblePlace = {
+  id: string;
+  name: string;
+  recipe?: string;
+  description: string;
+  refPrompt?: string;
+};
 
-  const isComponentOrShotInit = (name: string, init: ts.Expression): boolean => {
-    const u = unwrapExpr(init);
-    if (ts.isCallExpression(u) && ts.isIdentifier(u.expression) && /^(?:shot|phoneShot|tabletopShot)$/.test(u.expression.text)) return true;
-    if ((ts.isArrowFunction(u) || ts.isFunctionExpression(u)) && /^[A-Z]/.test(name)) return true;
-    if (ts.isIdentifier(u) && helpersMap.has(u.text)) return true;
-    return false;
-  };
+export type EpisodeBible = {
+  stylePrompt: string;
+  negativePrompt?: string;
+  characters: BibleCharacter[];
+  places: BiblePlace[];
+};
 
-  let seenFirstShotOrLocalHelper = false;
-  for (const stmt of sf.statements) {
-    const isExp = isExportedStmt(stmt);
-    if (ts.isFunctionDeclaration(stmt) && stmt.name) {
-      const name = stmt.name.text;
-      const text = stmt.getText(sf);
-      if (isExp && /^S\d+$/.test(name)) {
-        seenFirstShotOrLocalHelper = true;
-        exportedShotIds.push(name);
-        ownBodies.set(name, text);
-        continue;
-      }
-      if (/^[A-Z]/.test(name)) {
-        helpersMap.set(name, text);
-        if (!seenFirstShotOrLocalHelper) headerChunks.push(text);
-        continue;
-      }
-    } else if (ts.isVariableStatement(stmt)) {
-      let handledAsShot = false;
-      for (const decl of stmt.declarationList.declarations) {
-        if (!ts.isIdentifier(decl.name)) continue;
-        const name = decl.name.text;
-        const text = stmt.declarationList.declarations.length === 1 ? stmt.getText(sf) : decl.getText(sf);
-        if (isExp && /^S\d+$/.test(name)) {
-          seenFirstShotOrLocalHelper = true;
-          exportedShotIds.push(name);
-          ownBodies.set(name, text);
-          handledAsShot = true;
-        } else if (!isExp && decl.initializer && isComponentOrShotInit(name, decl.initializer)) {
-          helpersMap.set(name, text);
-          if (seenFirstShotOrLocalHelper) handledAsShot = true;
-        }
-      }
-      if (handledAsShot) continue;
-    }
-    if (!seenFirstShotOrLocalHelper) {
-      headerChunks.push(stmt.getText(sf));
-    }
+export type OnScreenTextSpec = {
+  kind: 'phone' | 'document' | 'sign' | 'board' | 'screen';
+  text: string;
+  lang?: 'fr' | 'en';
+} | null;
+
+export const VALID_SHOT_ANGLES = ['level', 'low', 'high'] as const;
+export const VALID_SHOT_VIEWS = ['front', 'reverse', 'left', 'right', '3/4-left', '3/4-right'] as const;
+export const VALID_CAMERA_MOVES = ['still', 'push', 'pull', 'pan', 'track', 'whip'] as const;
+export const VALID_ONSCREEN_KINDS = ['phone', 'document', 'sign', 'board', 'screen'] as const;
+
+export type DiffusionShotSpec = {
+  id: string;
+  place: string;
+  characters: string[];
+  size?: string;
+  angle?: (typeof VALID_SHOT_ANGLES)[number];
+  view?: (typeof VALID_SHOT_VIEWS)[number];
+  cameraMove?: (typeof VALID_CAMERA_MOVES)[number];
+  imagePrompt: string;
+  imageModel?: string;
+  negativePrompt?: string;
+  onScreenText?: OnScreenTextSpec;
+  videoPrompt: string;
+  sfxHint: string;
+  seed?: number;
+};
+
+const UPPER_ID_RE = /^[A-Z][A-Z0-9_]*$/;
+const SHOT_ID_RE = /^S\d+$/;
+
+const NEGATIVE_CLAUSE_RE =
+  /\b(?:strictly\s+no|absolutely\s+no|no|without|avoid|forbid(?:den)?|never(?:\s+add)?|zero|exclude|excluding|free\s+of)\b(?:(?!\b(?:but|with|only|except|featuring|showing|including|use|keep|render|maintain)\b)[^.;!?\n—])*/gi;
+
+/** Strip explicit negative clauses ("no music", "without dialogue", "avoid title cards") before checking positive requests. */
+export function stripNegativeClauses(text: string): string {
+  return String(text ?? '').replace(NEGATIVE_CLAUSE_RE, ' ');
+}
+
+const TITLE_REQUEST_RE =
+  /\b(title\s*card|opening\s+title|episode\s+title|hook[\s-]+title|title\s+screen|subtitles?|caption\s+bar)\b/i;
+const MUSIC_REQUEST_RE =
+  /\b(background\s+music|soundtrack|bgm|musical\s+score|music\s+bed|cinematic\s+score|orchestral\s+music|lo-?fi\s+beat|pop\s+song|music\s+track|piano\s+melody)\b/i;
+const DIALOGUE_REQUEST_RE =
+  /\b(dialogue|voiceover|voice[\s-]over|spoken\s+lines?|speaking\s+aloud|narrator\s+(?:says|speaks)|characters?\s+(?:speaking|talking)|spoken\s+words?|lip[\s-]*sync(?:ed)?(?:\s+speech)?|questioning\s+\w+|interrogating\s+\w+|talking\s+to\s+\w+|shouting\s+words|mouth\s+moving\s+in\s+speech)\b/i;
+
+export function hasPositiveTitleRequest(text: string): boolean {
+  return TITLE_REQUEST_RE.test(stripNegativeClauses(text));
+}
+
+export function hasPositiveMusicRequest(text: string): boolean {
+  return MUSIC_REQUEST_RE.test(stripNegativeClauses(text));
+}
+
+export function hasPositiveDialogueRequest(text: string): boolean {
+  return DIALOGUE_REQUEST_RE.test(stripNegativeClauses(text));
+}
+
+export function validateBible(raw: unknown): { bible: EpisodeBible | null; errors: string[] } {
+  const errors: string[] = [];
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { bible: null, errors: ['bible.json must be a JSON object'] };
+  }
+  const obj = raw as Record<string, unknown>;
+  const stylePrompt = String(obj.stylePrompt ?? '').trim();
+  if (stylePrompt.length < 20) {
+    errors.push('bible.stylePrompt is too short (at least 20 chars describing the 2D visual style)');
+  } else if (hasPositiveTitleRequest(stylePrompt)) {
+    errors.push('bible.stylePrompt must NOT request title cards or subtitles (the episode uses no titles/subtitles)');
   }
 
-  const shotBodies: Record<string, string> = {};
-  const helperNames = [...helpersMap.keys()];
-  for (const [id, own] of ownBodies) {
-    if (!helperNames.length) {
-      shotBodies[id] = own;
+  const negativePrompt = typeof obj.negativePrompt === 'string' ? obj.negativePrompt.trim() : undefined;
+
+  const rawPlaces = Array.isArray(obj.places) ? obj.places : [];
+  if (!rawPlaces.length) {
+    errors.push('bible.places must contain at least 1 place object ({ id, name, description })');
+  }
+  const places: BiblePlace[] = [];
+  const placeIds = new Set<string>();
+  for (let i = 0; i < rawPlaces.length; i++) {
+    const item = rawPlaces[i];
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      errors.push(`bible.places[${i}] must be an object`);
       continue;
     }
-    const seen = new Set<string>();
-    const extra: string[] = [];
-    const visit = (code: string, depth: number) => {
-      if (depth > 8) return;
-      for (const h of helperNames) {
-        if (seen.has(h)) continue;
-        if (new RegExp(`\\b${h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(code)) {
-          seen.add(h);
-          const hCode = helpersMap.get(h)!;
-          extra.push(hCode);
-          visit(hCode, depth + 1);
-        }
-      }
-    };
-    visit(own, 0);
-    shotBodies[id] = extra.length ? `${own}\n${extra.join('\n')}` : own;
+    const p = item as Record<string, unknown>;
+    const id = String(p.id ?? '').trim();
+    const name = String(p.name ?? id).trim();
+    const description = String(p.description ?? '').trim();
+    const recipe = typeof p.recipe === 'string' && p.recipe.trim() ? p.recipe.trim() : undefined;
+    const refPrompt = typeof p.refPrompt === 'string' && p.refPrompt.trim() ? p.refPrompt.trim() : undefined;
+    if (!UPPER_ID_RE.test(id)) {
+      errors.push(`bible.places[${i}].id must be UPPERCASE_SLUG (got "${id}")`);
+    } else if (placeIds.has(id)) {
+      errors.push(`bible.places[${i}].id "${id}" is duplicated`);
+    } else {
+      placeIds.add(id);
+    }
+    if (description.length < 20) {
+      errors.push(`bible.places[${i}] (${id || i}).description is too short (at least 20 chars)`);
+    }
+    places.push({ id, name: name || id, ...(recipe ? { recipe } : {}), description, ...(refPrompt ? { refPrompt } : {}) });
   }
 
+  const rawChars = Array.isArray(obj.characters) ? obj.characters : [];
+  const characters: BibleCharacter[] = [];
+  const charIds = new Set<string>();
+  for (let i = 0; i < rawChars.length; i++) {
+    const item = rawChars[i];
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      errors.push(`bible.characters[${i}] must be an object`);
+      continue;
+    }
+    const c = item as Record<string, unknown>;
+    const id = String(c.id ?? '').trim();
+    const name = String(c.name ?? id).trim();
+    const role = typeof c.role === 'string' && c.role.trim() ? c.role.trim() : undefined;
+    const appearance = String(c.appearance ?? '').trim();
+    const refPrompt = typeof c.refPrompt === 'string' && c.refPrompt.trim() ? c.refPrompt.trim() : undefined;
+    if (!UPPER_ID_RE.test(id)) {
+      errors.push(`bible.characters[${i}].id must be UPPERCASE_SLUG (got "${id}")`);
+    } else if (charIds.has(id)) {
+      errors.push(`bible.characters[${i}].id "${id}" is duplicated`);
+    } else {
+      charIds.add(id);
+    }
+    if (appearance.length < 20) {
+      errors.push(`bible.characters[${i}] (${id || i}).appearance is too short (at least 20 chars describing hair, face, clothes, build)`);
+    }
+    characters.push({ id, name: name || id, ...(role ? { role } : {}), appearance, ...(refPrompt ? { refPrompt } : {}) });
+  }
+
+  if (errors.length) return { bible: null, errors };
   return {
-    header: headerChunks.join('\n').trim(),
-    helpersMap,
-    ownBodies,
-    shotBodies,
-    exportedShotIds,
+    bible: {
+      stylePrompt,
+      ...(negativePrompt ? { negativePrompt } : {}),
+      characters,
+      places,
+    },
+    errors: [],
   };
 }
 
-export type EpisodeShotsBundle = {
-  isModular: boolean;
-  exists: boolean;
-  isPlaceholder: boolean;
-  sharedSource: string;
-  helpersMap: Map<string, string>;
-  shotFiles: Map<string, string>;
-  shotBodies: Record<string, string>;
-  exportedShotIds: string[];
-  /** Unified source text across shared.tsx + all shots (for palette, cast, seed, and global metrics). */
-  combinedSource: string;
-  /** Most recent modification timestamp across shots.tsx, shared.tsx, and shots/S*.tsx. */
-  latestMtimeMs: number;
-  /** Per-shot modification timestamps (when modular) for delta tracking. */
-  shotMtimesMs: Map<string, number>;
-};
+export function validateShotSpec(raw: unknown, expectedId?: string): { shot: DiffusionShotSpec | null; errors: string[] } {
+  const errors: string[] = [];
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { shot: null, errors: ['shot spec must be a JSON object'] };
+  }
+  const obj = raw as Record<string, unknown>;
+  const id = String(obj.id ?? expectedId ?? '').trim().toUpperCase();
+  if (!SHOT_ID_RE.test(id)) {
+    errors.push(`shot.id must be "S<N>" (got "${String(obj.id ?? '')}")`);
+  } else if (expectedId && id !== expectedId.toUpperCase()) {
+    errors.push(`shot.id "${id}" does not match expected "${expectedId.toUpperCase()}"`);
+  }
+
+  const place = String(obj.place ?? '').trim();
+  if (!UPPER_ID_RE.test(place)) {
+    errors.push(`${id || 'shot'}.place must be an UPPERCASE place id from bible.json (got "${place}")`);
+  }
+
+  const rawChars = obj.characters;
+  const characters: string[] = [];
+  if (!Array.isArray(rawChars)) {
+    errors.push(`${id || 'shot'}.characters must be an array of character IDs from bible.json (use [] when no character is visible)`);
+  } else {
+    const seen = new Set<string>();
+    for (const c of rawChars) {
+      const cid = String(c ?? '').trim();
+      if (!UPPER_ID_RE.test(cid)) {
+        errors.push(`${id || 'shot'}.characters entry "${cid}" must be an UPPERCASE character ID`);
+      } else if (seen.has(cid)) {
+        errors.push(`${id || 'shot'}.characters contains duplicate ID "${cid}"`);
+      } else {
+        seen.add(cid);
+        characters.push(cid);
+      }
+    }
+  }
+
+  const size = typeof obj.size === 'string' && obj.size.trim() ? obj.size.trim() : undefined;
+  if (size && /\b(title|hook-title|title-card)\b/i.test(size)) {
+    errors.push(`${id || 'shot'}.size "${size}" is forbidden: title shots are removed in this studio`);
+  }
+
+  let angle: DiffusionShotSpec['angle'];
+  if (obj.angle !== undefined && obj.angle !== null && String(obj.angle).trim() !== '') {
+    const a = String(obj.angle).trim();
+    if (!VALID_SHOT_ANGLES.includes(a as any)) {
+      errors.push(`${id || 'shot'}.angle must be one of ${VALID_SHOT_ANGLES.join(', ')}`);
+    } else {
+      angle = a as DiffusionShotSpec['angle'];
+    }
+  }
+
+  let view: DiffusionShotSpec['view'];
+  if (obj.view !== undefined && obj.view !== null && String(obj.view).trim() !== '') {
+    const v = String(obj.view).trim();
+    if (!VALID_SHOT_VIEWS.includes(v as any)) {
+      errors.push(`${id || 'shot'}.view must be one of ${VALID_SHOT_VIEWS.join(', ')}`);
+    } else {
+      view = v as DiffusionShotSpec['view'];
+    }
+  }
+
+  let cameraMove: DiffusionShotSpec['cameraMove'];
+  if (obj.cameraMove !== undefined && obj.cameraMove !== null && String(obj.cameraMove).trim() !== '') {
+    const m = String(obj.cameraMove).trim();
+    if (!VALID_CAMERA_MOVES.includes(m as any)) {
+      errors.push(`${id || 'shot'}.cameraMove must be one of ${VALID_CAMERA_MOVES.join(', ')}`);
+    } else {
+      cameraMove = m as DiffusionShotSpec['cameraMove'];
+    }
+  }
+
+  const imagePrompt = String(obj.imagePrompt ?? '').trim();
+  if (imagePrompt.length < 30) {
+    errors.push(`${id || 'shot'}.imagePrompt is too short (${imagePrompt.length} chars, need at least 30 chars in English for Nano Banana 2 Lite)`);
+  } else if (hasPositiveTitleRequest(imagePrompt)) {
+    errors.push(`${id || 'shot'}.imagePrompt requests a title card or subtitles, which are forbidden (only in-world text via onScreenText is allowed)`);
+  }
+
+  const negativePrompt = typeof obj.negativePrompt === 'string' && obj.negativePrompt.trim() ? obj.negativePrompt.trim() : undefined;
+  let imageModel: string | undefined;
+  if (obj.imageModel !== undefined && obj.imageModel !== null && String(obj.imageModel).trim() !== '') {
+    const im = String(obj.imageModel).trim();
+    if (/[\s\x00-\x1f]/.test(im)) {
+      errors.push(`${id || 'shot'}.imageModel must not contain spaces or control characters (got "${im}")`);
+    } else {
+      imageModel = im;
+    }
+  }
+
+  let onScreenText: OnScreenTextSpec | undefined;
+  if (obj.onScreenText !== undefined) {
+    if (obj.onScreenText === null) {
+      onScreenText = null;
+    } else if (typeof obj.onScreenText !== 'object' || Array.isArray(obj.onScreenText)) {
+      errors.push(`${id || 'shot'}.onScreenText must be null or { kind, text, lang }`);
+    } else {
+      const ost = obj.onScreenText as Record<string, unknown>;
+      const kind = String(ost.kind ?? '').trim();
+      const text = String(ost.text ?? '').trim();
+      const lang = ost.lang !== undefined && ost.lang !== null ? String(ost.lang).trim().toLowerCase() : undefined;
+      if (!text || /^(?:none|null|n\/a|nil)$/i.test(text) || /^none$/i.test(kind)) {
+        onScreenText = null;
+      } else {
+        if (!VALID_ONSCREEN_KINDS.includes(kind as any)) {
+          errors.push(`${id || 'shot'}.onScreenText.kind must be one of ${VALID_ONSCREEN_KINDS.join(', ')}`);
+        }
+        if (hasPositiveTitleRequest(text)) {
+          errors.push(`${id || 'shot'}.onScreenText.text must not be a title card or subtitle`);
+        }
+        if (lang !== undefined && lang !== '' && lang !== 'fr' && lang !== 'en') {
+          errors.push(`${id || 'shot'}.onScreenText.lang must be "fr" or "en"`);
+        }
+        if (!errors.length) {
+          onScreenText = {
+            kind: kind as NonNullable<OnScreenTextSpec>['kind'],
+            text,
+            ...(lang === 'fr' || lang === 'en' ? { lang } : {}),
+          };
+        }
+      }
+    }
+  }
+
+  const videoPrompt = String(obj.videoPrompt ?? '').trim();
+  if (videoPrompt.length < 20) {
+    errors.push(`${id || 'shot'}.videoPrompt is too short (${videoPrompt.length} chars, need at least 20 chars describing motion for Gemini Omni Flash 2.1)`);
+  } else {
+    if (hasPositiveMusicRequest(videoPrompt)) {
+      errors.push(`${id || 'shot'}.videoPrompt must NOT request music or a soundtrack (Omni Flash generates SFX + ambience only)`);
+    }
+    if (hasPositiveDialogueRequest(videoPrompt)) {
+      errors.push(`${id || 'shot'}.videoPrompt must NOT request spoken dialogue or voiceover (narration comes from :8005)`);
+    }
+  }
+
+  const sfxHint = String(obj.sfxHint ?? '').trim();
+  if (sfxHint.length < 5) {
+    errors.push(`${id || 'shot'}.sfxHint is required (at least 5 chars describing physical foley & ambient SFX for Omni Flash 2.1, e.g. "wooden chair scrape, quiet room tone")`);
+  } else {
+    if (hasPositiveMusicRequest(sfxHint)) {
+      errors.push(`${id || 'shot'}.sfxHint must NOT request music or a musical score (SFX and ambience only)`);
+    }
+    if (hasPositiveDialogueRequest(sfxHint)) {
+      errors.push(`${id || 'shot'}.sfxHint must NOT request dialogue or spoken voice`);
+    }
+  }
+
+  let seed: number | undefined;
+  if (obj.seed !== undefined && obj.seed !== null && obj.seed !== '') {
+    const n = Number(obj.seed);
+    if (!Number.isInteger(n) || n < 0) {
+      errors.push(`${id || 'shot'}.seed must be a non-negative integer`);
+    } else if (n > 0) {
+      seed = n;
+    }
+  }
+
+  if (errors.length) return { shot: null, errors };
+  return {
+    shot: {
+      id,
+      place,
+      characters,
+      ...(size ? { size } : {}),
+      ...(angle ? { angle } : {}),
+      ...(view ? { view } : {}),
+      ...(cameraMove ? { cameraMove } : {}),
+      imagePrompt,
+      ...(imageModel ? { imageModel } : {}),
+      ...(negativePrompt ? { negativePrompt } : {}),
+      ...(onScreenText !== undefined ? { onScreenText } : {}),
+      videoPrompt,
+      sfxHint,
+      ...(seed !== undefined ? { seed } : {}),
+    },
+    errors: [],
+  };
+}
 
 function safeMtimeMs(file: string): number {
   try {
@@ -300,114 +371,105 @@ function safeMtimeMs(file: string): number {
   }
 }
 
-/**
- * Read an episode's shot definitions seamlessly whether the episode uses:
- * - **Modular layout**: `shared.tsx` + `shots/S1.tsx .. S<N>.tsx` + barrel `shots.tsx`, OR
- * - **Legacy monolithic layout**: all code in `shots.tsx`.
- */
-export function readEpisodeShots(epDir: string): EpisodeShotsBundle {
-  const barrelPath = path.join(epDir, 'shots.tsx');
-  const sharedPath = path.join(epDir, 'shared.tsx');
-  const shotsDir = path.join(epDir, 'shots');
-
-  const barrelExists = fs.existsSync(barrelPath);
-  const barrelRaw = barrelExists ? fs.readFileSync(barrelPath, 'utf8') : '';
-  const hasShotsDir = fs.existsSync(shotsDir) && fs.statSync(shotsDir).isDirectory();
-  const hasSharedFile = fs.existsSync(sharedPath) && fs.statSync(sharedPath).isFile();
-
-  // Modular mode applies whenever `shots/` or `shared.tsx` is present AND `shots.tsx` wasn't manually overwritten with monolithic shots.
-  const barrelLooksMonolithic =
-    barrelExists &&
-    /export\s+(?:const|function)\s+S\d+\b/.test(barrelRaw) &&
-    !/from\s+['"]\.\/shots\//.test(barrelRaw);
-  const isModular = (hasShotsDir || hasSharedFile) && !barrelLooksMonolithic;
-
-  if (!isModular) {
-    const latestMtimeMs = safeMtimeMs(barrelPath);
-    const shotMtimesMs = new Map<string, number>();
-    if (!barrelExists) {
-      return {
-        isModular: false,
-        exists: false,
-        isPlaceholder: false,
-        sharedSource: '',
-        helpersMap: new Map(),
-        shotFiles: new Map(),
-        shotBodies: {},
-        exportedShotIds: [],
-        combinedSource: '',
-        latestMtimeMs: 0,
-        shotMtimesMs,
-      };
-    }
-    const isPlaceholder = barrelRaw.includes('SHOT S1 — PLACEHOLDER');
-    const sliced = sliceMonolithicShots(barrelRaw);
-    for (const id of sliced.exportedShotIds) shotMtimesMs.set(id, latestMtimeMs);
+export function readEpisodeBible(epDir: string): {
+  exists: boolean;
+  bible: EpisodeBible | null;
+  raw: string;
+  mtimeMs: number;
+  errors: string[];
+} {
+  const biblePath = path.join(epDir, 'bible.json');
+  if (!fs.existsSync(biblePath)) {
+    return { exists: false, bible: null, raw: '', mtimeMs: 0, errors: ['bible.json is missing'] };
+  }
+  const mtimeMs = safeMtimeMs(biblePath);
+  const raw = fs.readFileSync(biblePath, 'utf8');
+  try {
+    const parsed = JSON.parse(raw);
+    const { bible, errors } = validateBible(parsed);
+    return { exists: true, bible, raw, mtimeMs, errors };
+  } catch (err) {
     return {
-      isModular: false,
       exists: true,
-      isPlaceholder,
-      sharedSource: sliced.header,
-      helpersMap: sliced.helpersMap,
-      shotFiles: new Map(),
-      shotBodies: sliced.shotBodies,
-      exportedShotIds: sliced.exportedShotIds,
-      combinedSource: barrelRaw,
-      latestMtimeMs,
-      shotMtimesMs,
+      bible: null,
+      raw,
+      mtimeMs,
+      errors: [`bible.json is invalid JSON: ${(err as Error).message}`],
     };
   }
+}
 
-  // Modular episode (`shared.tsx` + `shots/S*.tsx` + barrel `shots.tsx`)
-  const sharedSource = hasSharedFile ? fs.readFileSync(sharedPath, 'utf8') : '';
-  const sharedSliced = sharedSource ? sliceMonolithicShots(sharedSource) : null;
-  const helpersMap = new Map<string, string>(sharedSliced?.helpersMap ?? []);
+export type EpisodeShotsBundle = {
+  exists: boolean;
+  isPlaceholder: boolean;
+  bible: EpisodeBible | null;
+  bibleRaw: string;
+  bibleMtimeMs: number;
+  shots: Map<string, DiffusionShotSpec>;
+  shotFiles: Map<string, string>;
+  shotBodies: Record<string, string>;
+  exportedShotIds: string[];
+  combinedSource: string;
+  latestMtimeMs: number;
+  shotMtimesMs: Map<string, number>;
+};
+
+/**
+ * Read an episode's diffusion Bible (`bible.json`) and modular per-shot prompt specs (`shots/S<N>.json`).
+ */
+export function readEpisodeShots(epDir: string): EpisodeShotsBundle {
+  const shotsDir = path.join(epDir, 'shots');
+  const bibleRes = readEpisodeBible(epDir);
+  const shots = new Map<string, DiffusionShotSpec>();
   const shotFiles = new Map<string, string>();
   const shotBodies: Record<string, string> = {};
   const shotMtimesMs = new Map<string, number>();
-  let latestMtimeMs = Math.max(safeMtimeMs(barrelPath), safeMtimeMs(sharedPath));
+  let latestMtimeMs = bibleRes.mtimeMs;
 
-  if (hasShotsDir) {
+  if (fs.existsSync(shotsDir) && fs.statSync(shotsDir).isDirectory()) {
     const entries = fs
       .readdirSync(shotsDir)
-      .filter((f) => /^S\d+\.tsx$/i.test(f))
+      .filter((f) => /^S\d+\.json$/i.test(f))
       .sort((a, b) => a.localeCompare(b, 'en', { numeric: true }));
     for (const fname of entries) {
-      const id = fname.replace(/\.tsx$/i, '').toUpperCase();
+      const id = fname.replace(/\.json$/i, '').toUpperCase();
       const fpath = path.join(shotsDir, fname);
       const raw = fs.readFileSync(fpath, 'utf8');
       const mtime = safeMtimeMs(fpath);
       if (mtime > latestMtimeMs) latestMtimeMs = mtime;
       shotMtimesMs.set(id, mtime);
       shotFiles.set(id, raw);
-      // Strip import lines for the shot body so audits/metrics inspect clean executable shot + local helper code
-      const withoutImports = raw.replace(/^\s*import\s+[\s\S]*?from\s+['"][^'"]+['"];?\s*$/gm, '').trim();
-      shotBodies[id] = withoutImports || raw;
+      shotBodies[id] = raw.trim();
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          shots.set(id, parsed as DiffusionShotSpec);
+        }
+      } catch {
+        /* invalid JSON handled by audits */
+      }
     }
   }
 
-  const exportedShotIds = sortShotIds(
-    [...shotFiles.entries()]
-      .filter(([id, code]) => new RegExp(`export\\s+(?:const|function)\\s+${id}\\b`).test(code))
-      .map(([id]) => id),
-  );
+  const exportedShotIds = sortShotIds([...shotFiles.keys()]);
   const isPlaceholder =
-    exportedShotIds.length <= 1 &&
-    (barrelRaw.includes('SHOT S1 — PLACEHOLDER') || (shotFiles.get('S1') ?? '').includes('SHOT S1 — PLACEHOLDER'));
+    exportedShotIds.length === 0 ||
+    (exportedShotIds.length <= 1 && /PLACEHOLDER/i.test(shotFiles.get('S1') ?? ''));
 
   const combinedParts: string[] = [];
-  if (sharedSource.trim()) combinedParts.push(sharedSource.trim());
+  if (bibleRes.raw.trim()) combinedParts.push(bibleRes.raw.trim());
   for (const id of exportedShotIds) {
     const body = shotBodies[id];
     if (body) combinedParts.push(body);
   }
 
   return {
-    isModular: true,
-    exists: barrelExists || hasSharedFile || shotFiles.size > 0,
+    exists: bibleRes.exists || shotFiles.size > 0,
     isPlaceholder,
-    sharedSource,
-    helpersMap,
+    bible: bibleRes.bible,
+    bibleRaw: bibleRes.raw,
+    bibleMtimeMs: bibleRes.mtimeMs,
+    shots,
     shotFiles,
     shotBodies,
     exportedShotIds,
@@ -415,287 +477,4 @@ export function readEpisodeShots(epDir: string): EpisodeShotsBundle {
     latestMtimeMs,
     shotMtimesMs,
   };
-}
-
-/** Normalize lowercase `<shot ...>` JSX tags to `<Shot ...>` and ensure `Shot` is imported alongside `shot`. */
-export function normalizeShotTagJsx(code: string): string {
-  if (!/<shot(?=[\s/>])/.test(code)) return code;
-  let out = code.replace(/<shot(?=[\s/>])/g, '<Shot').replace(/<\/shot\s*>/g, '</Shot>');
-  out = out.replace(
-    /import\s*\{([^}]*)\}\s*from\s*(['"](?:\.\.\/)+engine['"])/,
-    (full, names: string, mod: string) => {
-      if (/\bShot\b/.test(names)) return full;
-      return `import {${names.replace(/\bshot\b/, 'shot, Shot')}} from ${mod}`;
-    },
-  );
-  return out;
-}
-
-/**
- * Normalize `src/episodes/<slug>/shared.tsx`:
- * - fixes accidental `../../../engine` back to `../../engine`,
- * - auto-exports top-level `const` / `let` / `function` / `type` / `interface` declarations so `shots/S<N>.tsx`
- *   and `shots.tsx` (`export * from './shared'`) can import every shared place, cast member, and helper without
- *   TypeScript errors if the model forgot `export`.
- */
-export function normalizeSharedEpisodeFile(rawCode: string): string {
-  let code = normalizeShotTagJsx(rawCode).replace(/from\s+(['"])\.\.\/\.\.\/\.\.\/engine\1/g, "from '../../engine'");
-  const sf = ts.createSourceFile('shared.tsx', code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-  const inserts: number[] = [];
-  for (const stmt of sf.statements) {
-    if (isExportedStmt(stmt)) continue;
-    if (
-      ts.isVariableStatement(stmt) ||
-      (ts.isFunctionDeclaration(stmt) && stmt.name) ||
-      ts.isTypeAliasDeclaration(stmt) ||
-      ts.isInterfaceDeclaration(stmt)
-    ) {
-      inserts.push(stmt.getStart(sf));
-    }
-  }
-  for (let i = inserts.length - 1; i >= 0; i--) {
-    const at = inserts[i]!;
-    code = code.slice(0, at) + 'export ' + code.slice(at);
-  }
-  return code.endsWith('\n') ? code : code + '\n';
-}
-
-/**
- * Prepare an isolated `src/episodes/<slug>/shots/S<N>.tsx` file:
- * - fixes relative import paths (`../../engine` -> `../../../engine`, `./shared` -> `../shared`),
- * - normalizes `<shot>` JSX tags to `<Shot>`,
- * - automatically injects missing `React`, `'../../../engine'`, and `'../shared'` imports so `edit_shot` works
- *   even when the agent sends just `export const S7 = shot({ place: SALON, people: [{ who: LEA, ... }] });`!
- */
-export function prepareModularShotFile(projectRoot: string, epDir: string, id: string, rawCode: string): string {
-  let code = rawCode
-    .trim()
-    .replace(/from\s+(['"])\.\.\/\.\.\/engine\1/g, "from '../../../engine'")
-    .replace(/from\s+(['"])\.\/shared\1/g, "from '../shared'");
-  code = normalizeShotTagJsx(code);
-
-  const sf = ts.createSourceFile(`${id}.tsx`, code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-  const importedNames = new Set<string>();
-  const localDeclared = new Set<string>();
-  let hasReactImport = false;
-
-  for (const stmt of sf.statements) {
-    if (ts.isImportDeclaration(stmt) && stmt.importClause) {
-      const cl = stmt.importClause;
-      if (cl.name) {
-        importedNames.add(cl.name.text);
-        if (cl.name.text === 'React') hasReactImport = true;
-      }
-      if (cl.namedBindings) {
-        if (ts.isNamespaceImport(cl.namedBindings)) {
-          importedNames.add(cl.namedBindings.name.text);
-          if (cl.namedBindings.name.text === 'React') hasReactImport = true;
-        } else if (ts.isNamedImports(cl.namedBindings)) {
-          for (const el of cl.namedBindings.elements) importedNames.add(el.name.text);
-        }
-      }
-    } else if (ts.isFunctionDeclaration(stmt) && stmt.name) {
-      localDeclared.add(stmt.name.text);
-    } else if (ts.isTypeAliasDeclaration(stmt) || ts.isInterfaceDeclaration(stmt)) {
-      localDeclared.add(stmt.name.text);
-    } else if (ts.isVariableStatement(stmt)) {
-      for (const d of stmt.declarationList.declarations) {
-        if (ts.isIdentifier(d.name)) localDeclared.add(d.name.text);
-      }
-    }
-  }
-
-  // Collect all identifier tokens used in value or type positions (excluding object property keys `foo: ...` and property accesses `.foo`)
-  const usedIds = new Set<string>();
-  let usesJsx = false;
-  const visit = (node: ts.Node) => {
-    if (ts.isJsxElement(node) || ts.isJsxSelfClosingElement(node) || ts.isJsxFragment(node)) usesJsx = true;
-    if (ts.isIdentifier(node)) {
-      const parent = node.parent;
-      const isPropName =
-        (ts.isPropertyAssignment(parent) && parent.name === node) ||
-        (ts.isPropertySignature(parent) && parent.name === node) ||
-        (ts.isPropertyAccessExpression(parent) && parent.name === node);
-      if (!isPropName) usedIds.add(node.text);
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sf);
-
-  const sharedPath = path.join(epDir, 'shared.tsx');
-  const sharedExports = new Set<string>(
-    fs.existsSync(sharedPath) ? exportedSymbols(fs.readFileSync(sharedPath, 'utf8')) : [],
-  );
-  const engineExports = discoverEngineExports(projectRoot);
-
-  const needEngine: string[] = [];
-  const needShared: string[] = [];
-  for (const sym of usedIds) {
-    if (importedNames.has(sym) || localDeclared.has(sym)) continue;
-    if (sharedExports.has(sym)) needShared.push(sym);
-    else if (engineExports.has(sym)) needEngine.push(sym);
-  }
-
-  const autoImports: string[] = [];
-  if (!hasReactImport && (usesJsx || usedIds.has('React'))) {
-    autoImports.push(`import React from 'react';`);
-  }
-  if (needEngine.length) {
-    autoImports.push(`import { ${needEngine.sort().join(', ')} } from '../../../engine';`);
-  }
-  if (needShared.length) {
-    autoImports.push(`import { ${needShared.sort().join(', ')} } from '../shared';`);
-  }
-
-  const full = autoImports.length ? `${autoImports.join('\n')}\n\n${code}\n` : `${code}\n`;
-  return full;
-}
-
-/**
- * Rebuild `src/episodes/<slug>/shots.tsx` as a clean barrel re-exporting `./shared` and every `./shots/S<N>`,
- * and keep `src/episodes/<slug>/index.tsx` shot registrations synchronized when `index.tsx` uses the standard
- * `defineEpisode(..., { shots: { ... } })` shape.
- */
-export function syncShotsBarrel(epDir: string): string[] {
-  const sharedPath = path.join(epDir, 'shared.tsx');
-  const shotsDir = path.join(epDir, 'shots');
-  const barrelPath = path.join(epDir, 'shots.tsx');
-
-  const hasShared = fs.existsSync(sharedPath);
-  const shotIds: string[] = [];
-  let maxSourceMtime = hasShared ? safeMtimeMs(sharedPath) : 0;
-
-  if (fs.existsSync(shotsDir)) {
-    for (const fname of fs.readdirSync(shotsDir)) {
-      const m = /^(S\d+)\.tsx$/i.exec(fname);
-      if (!m) continue;
-      const id = m[1]!.toUpperCase();
-      const fpath = path.join(shotsDir, fname);
-      const code = fs.readFileSync(fpath, 'utf8');
-      if (new RegExp(`export\\s+(?:const|function)\\s+${id}\\b`).test(code)) {
-        shotIds.push(id);
-        const mt = safeMtimeMs(fpath);
-        if (mt > maxSourceMtime) maxSourceMtime = mt;
-      }
-    }
-  }
-  const sorted = sortShotIds(shotIds);
-  const lines: string[] = [
-    '// Auto-generated barrel — edit shared.tsx or individual shots via edit_shot (shots/S<N>.tsx)',
-  ];
-  if (hasShared) lines.push(`export * from './shared';`);
-  for (const id of sorted) lines.push(`export { ${id} } from './shots/${id}';`);
-  fs.writeFileSync(barrelPath, lines.join('\n') + '\n', 'utf8');
-  if (maxSourceMtime > 0) {
-    try {
-      const sec = maxSourceMtime / 1000;
-      fs.utimesSync(barrelPath, sec, sec);
-    } catch {
-      /* ignore utimes failure */
-    }
-  }
-
-  // Keep index.tsx shot imports & registrations aligned when index.tsx has the standard defineEpisode pattern
-  const indexPath = path.join(epDir, 'index.tsx');
-  if (sorted.length > 0 && fs.existsSync(indexPath)) {
-    try {
-      const idxRaw = fs.readFileSync(indexPath, 'utf8');
-      if (/import\s*\{[^}]*\}\s*from\s*['"]\.\/shots['"]/.test(idxRaw) && /\bshots\s*:\s*\{[^}]*\}/.test(idxRaw)) {
-        const list = sorted.join(', ');
-        const updated = idxRaw
-          .replace(/import\s*\{[^}]*\}\s*from\s*(['"]\.\/shots['"])/, `import { ${list} } from $1`)
-          .replace(/\bshots\s*:\s*\{[^}]*\}/, `shots: { ${list} }`);
-        if (updated !== idxRaw) fs.writeFileSync(indexPath, updated, 'utf8');
-      }
-    } catch {
-      /* ignore index sync errors */
-    }
-  }
-
-  return sorted;
-}
-
-/**
- * AST-safe replacement of a single shot `id` inside a legacy monolithic `shots.tsx`.
- * - Replaces `export const S<N> = ...` (plus any immediately preceding non-exported helper declarations
- *   that belong exclusively to `S<N>` or are redefined in `code`),
- * - NEVER deletes non-exported helper declarations immediately above `S<N+1>` (such as `BEFORE_PULL` / `AFTER_PULL`),
- * - Preserves comment lines introducing neighboring shots.
- */
-export function replaceShotMonolithic(src: string, id: string, code: string): { text: string; replaced: boolean } {
-  const block = code.trim();
-  const sf = ts.createSourceFile('shots.tsx', src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-
-  const codeSf = ts.createSourceFile('patch.tsx', block, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-  const redefinedInPatch = new Set<string>();
-  for (const st of codeSf.statements) {
-    if (ts.isFunctionDeclaration(st) && st.name) redefinedInPatch.add(st.name.text);
-    if (ts.isVariableStatement(st)) {
-      for (const d of st.declarationList.declarations) {
-        if (ts.isIdentifier(d.name)) redefinedInPatch.add(d.name.text);
-      }
-    }
-  }
-
-  let targetIdx = -1;
-  for (let i = 0; i < sf.statements.length; i++) {
-    const stmt = sf.statements[i]!;
-    if (!isExportedStmt(stmt)) continue;
-    if (ts.isFunctionDeclaration(stmt) && stmt.name?.text === id) {
-      targetIdx = i;
-      break;
-    }
-    if (ts.isVariableStatement(stmt)) {
-      if (stmt.declarationList.declarations.some((d) => ts.isIdentifier(d.name) && d.name.text === id)) {
-        targetIdx = i;
-        break;
-      }
-    }
-  }
-
-  if (targetIdx < 0) {
-    return { text: src + (src.endsWith('\n') || !src ? '' : '\n') + '\n' + block + '\n', replaced: false };
-  }
-
-  const targetStmt = sf.statements[targetIdx]!;
-  let replaceStart = targetStmt.getStart(sf);
-  const replaceEnd = targetStmt.end;
-
-  // Walk immediately preceding non-exported helper statements that belong ONLY to this shot or are redefined in `code`
-  const otherStatementsText = sf.statements
-    .filter((_, idx) => idx !== targetIdx)
-    .map((s) => s.getText(sf))
-    .join('\n');
-  const targetText = targetStmt.getText(sf);
-
-  for (let k = targetIdx - 1; k >= 0; k--) {
-    const prev = sf.statements[k]!;
-    if (isExportedStmt(prev) || ts.isImportDeclaration(prev)) break;
-    const names: string[] = [];
-    if (ts.isFunctionDeclaration(prev) && prev.name) names.push(prev.name.text);
-    else if (ts.isVariableStatement(prev)) {
-      for (const d of prev.declarationList.declarations) {
-        if (ts.isIdentifier(d.name)) names.push(d.name.text);
-      }
-    }
-    if (!names.length) break;
-    const belongsHere = names.every((n) => {
-      if (redefinedInPatch.has(n)) return true;
-      const re = new RegExp(`\\b${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
-      const usedInTarget = re.test(targetText);
-      const restWithoutPrev = sf.statements
-        .filter((_, idx) => idx !== targetIdx && idx !== k)
-        .map((s) => s.getText(sf))
-        .join('\n');
-      return usedInTarget && !re.test(restWithoutPrev) && /^[A-Z]/.test(n);
-    });
-    if (!belongsHere) break;
-    void otherStatementsText;
-    replaceStart = prev.getStart(sf);
-  }
-
-  const nextChar = src[replaceEnd];
-  const needsNewline = nextChar !== '\n' && nextChar !== '\r';
-  const out = src.slice(0, replaceStart) + block + (needsNewline ? '\n' : '') + src.slice(replaceEnd);
-  return { text: out, replaced: true };
 }
